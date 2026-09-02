@@ -5,6 +5,75 @@ months. Record the rejected options too — that's what stops the re-argument.
 
 ---
 
+## 2026-09-02 — Scope: market-data infrastructure, not a matching engine
+
+**Decision:** TickForge reconstructs and analyses market data. It does not
+match orders, simulate an exchange, or chase microsecond latency.
+
+**Why:** the skills being demonstrated are market-data engineering, async
+Python, reliability and research tooling. An ultra-low-latency matching engine
+is a different project with a different language.
+
+**Rejected — competing with C++ low-latency infrastructure:** unwinnable in
+Python and not the point. The interesting question is how far a
+well-engineered Python system goes for *data processing and research*.
+
+**Consequence:** latency targets are "fast enough to keep up with the feed and
+measurable", not "lowest possible". Performance work is benchmark-driven, not
+aspirational.
+
+---
+
+## 2026-09-02 — Exchange logic isolated behind adapters
+
+**Decision:** each venue gets an adapter that translates its wire format into
+normalized `MarketEvent`s. Nothing downstream knows the venue exists.
+
+**Why:** multi-venue support, testability without a live connection, and
+replay all depend on downstream code being venue-agnostic.
+
+**Rejected — exchange-specific handling throughout the pipeline:** faster for
+the first exchange, then every subsequent venue is a system-wide refactor.
+
+**Consequence:** the normalized event model must be rich enough for every
+venue's semantics. Where venues genuinely differ (sequencing schemes,
+resync procedures), the difference is absorbed *inside* the adapter even when
+that makes the adapter ugly.
+
+---
+
+## 2026-09-02 — Live and replay share one pipeline
+
+**Decision:** recorded events re-enter at the same seam as live events. No
+component branches on live-vs-replay.
+
+**Why:** replay's entire value is behavioural fidelity. Two code paths means
+two systems that drift.
+
+**Rejected — a dedicated replay engine:** simpler to write, but then replay
+stops being evidence about live behaviour, which is the only reason it exists.
+
+**Consequence:** the pipeline must not depend on wall-clock time for logic —
+only for pacing. Any wall-clock dependency breaks deterministic replay.
+
+---
+
+## 2026-09-02 — Invalid book state halts rather than degrades
+
+**Decision:** sequence gap, crossed book or failed validation marks the book
+invalid. It stops serving until resynchronisation succeeds.
+
+**Why:** *known invalid* beats *unknown but silently incorrect*. A corrupt book
+that keeps serving produces plausible numbers that nothing flags.
+
+**Rejected — best-effort continuation through gaps:** keeps uptime metrics
+pretty while quietly poisoning stored datasets and every downstream analysis.
+
+**Consequence:** the system will have visible downtime during resync. That is
+the intended trade — availability is sacrificed for correctness.
+
+---
+
 ## 2026-09-02 — Knowledge base is curated markdown, not a structured graph
 
 **Decision:** `docs/knowledge/` stores only what the source code cannot

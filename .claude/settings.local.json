@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl -d Ubuntu -- bash -lc 'ls -la ~/dev/TickForge 2>/dev/null && echo \"--- docs ---\" && find ~/dev/TickForge -type f -not -path \"*/.git/*\" | sort')",
+      "Bash(cd *)"
+    ]
+  }
+}

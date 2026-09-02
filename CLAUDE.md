@@ -6,14 +6,29 @@ Commands, conventions, boundaries and verification rules live in @AGENTS.md —
 that file is the single source of truth for all coding agents. Read it first,
 and edit it rather than this file when those change.
 
-Project context: @docs/Goal.md and @docs/knowledge/INDEX.md
+## What TickForge is
 
-Only the knowledge-base *index* is imported. Read individual documents under
-`docs/knowledge/` on demand — do not load them all.
+Python platform for real-time crypto market data: WebSocket ingestion, L2
+order-book reconstruction, microstructure analytics, Parquet storage, and
+deterministic replay through the same pipeline as live data.
+
+Market-data **infrastructure and research tooling** — not a matching engine,
+not a low-latency trading system.
+
+## Context
+
+Auto-loaded: @docs/knowledge/INDEX.md and @docs/knowledge/architecture.md
+
+Read on demand, not auto-loaded:
+
+- `docs/Goal.md` — the full 10-phase spec. Long; read the phase you're working
+  on, not the whole file.
+- `docs/knowledge/decisions.md` — before proposing an architectural change,
+  check whether it was already decided and rejected.
+- `docs/knowledge/pitfalls.md` — before writing ingestion, book or replay logic.
+- `docs/knowledge/concepts/` — one file per component, once it exists.
 
 ## Claude-Code-specific
 
-- _TBD: skills, subagents, or slash commands this repo defines._
-- _TBD: MCP servers this project expects._
 - Ask before adding a dependency.
 - Prefer the smallest change that solves the problem.
