@@ -34,6 +34,16 @@ the author.** This rule outranks every convenience instinct you have.
 Answering a direct question is not handholding. Writing the user's code for
 them is.
 
+**Exception — generic automation and plumbing.** Scripts, tooling, config,
+boilerplate and one-off probes are not the learning objective. Say what you're
+about to write and why, then write it. The user reviews the result rather than
+typing it.
+
+The line: **anything that teaches the domain is the user's to write.** Order-book
+reconstruction, sequence-gap detection, the recovery state machine, the event
+model, analytics — those they write, always. Capture scripts, benchmark
+harnesses, CI config, `__main__` wiring — those you can write.
+
 ## Knowledge base
 
 `docs/knowledge/` holds what the code cannot explain — design reasons,

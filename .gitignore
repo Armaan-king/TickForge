@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Captured market data — never commit this, it gets large fast
+data/
+*.jsonl
+*.parquet
+
+# Local agent state
+.claude/settings.local.json
+
+# OS / editors
+desktop.ini
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

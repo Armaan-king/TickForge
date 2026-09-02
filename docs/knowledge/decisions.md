@@ -5,6 +5,35 @@ months. Record the rejected options too — that's what stops the re-argument.
 
 ---
 
+## 2026-09-02 — Prices and quantities are `Decimal`
+
+**Decision:** `BookUpdate` carries price and quantity as `decimal.Decimal`.
+Events are `frozen=True, slots=True`, with level lists as tuples.
+
+**Why:** exchanges send prices as decimal *strings* (`"77381.36000000"`)
+specifically so the exact value survives — JSON numbers are IEEE-754 doubles
+and cannot represent most tick sizes. Price is a dictionary key in the order
+book, so an inexact type means levels that should match sometimes don't, and
+levels that should delete sometimes linger. Correctness before performance.
+
+**Rejected — `float`:** fastest and wrong. `0.1 + 0.2 != 0.3` becomes a
+phantom price level, and the failure is silent.
+
+**Rejected — scaled `int` (price × 10⁸):** exact *and* fast, and what
+production systems use. Rejected only for now: it requires tracking a scale
+factor per symbol and converting at every boundary, which is complexity bought
+before any measurement justified it.
+
+**Rejected — keeping the wire `str`:** lossless but useless — imbalance and
+VWAP need arithmetic.
+
+**Consequence:** `Decimal` is roughly 20× slower than int arithmetic and
+heavier in memory. This is the headline candidate for Phase 9: benchmark
+`Decimal` against scaled `int` and switch on evidence. Until then the
+representation is deliberately the slow, correct one.
+
+---
+
 ## 2026-09-02 — Scope: market-data infrastructure, not a matching engine
 
 **Decision:** TickForge reconstructs and analyses market data. It does not
