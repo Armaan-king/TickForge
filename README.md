@@ -16,12 +16,13 @@ Exchange WebSocket → Adapter → Normalized Events → Async Pipeline
 
 ## Status
 
-Pre-implementation. Spec and knowledge base in place; no code yet.
+Early. Normalized event model in place; ingestion next.
 
 ## Quick start
 
 ```
-TBD
+uv sync
+uv run pytest
 ```
 
 ## Docs

@@ -49,6 +49,13 @@ actually happened.
   older than the snapshot, per each venue's documented procedure.
 - **Avoid by:** implementing the venue's stated resync procedure exactly, and
   testing it. Never assume the generic approach works for a new venue.
+- **Binance specifically:** open the stream and buffer *before* fetching the
+  snapshot. Discard buffered updates with `last_seq <= snapshot.last_seq`. The
+  first update applied must **span** the boundary — `first_seq <=
+  snapshot.last_seq + 1 <= last_seq` — because the snapshot lands partway
+  through an update's range. Requiring exact contiguity there rejects the
+  first legitimate update and resyncs forever. `OrderBook` models this as the
+  `SEEDED` state, distinct from `SYNCED`.
 
 ## Silent exception swallowing in async tasks
 

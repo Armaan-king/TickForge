@@ -5,6 +5,29 @@ months. Record the rejected options too — that's what stops the re-argument.
 
 ---
 
+## 2026-09-02 — `apply()` returns a result; reads fail closed
+
+**Decision:** `OrderBook.apply()` returns an `ApplyResult` rather than raising
+on a sequence gap. Independently, every read (`best_bid`, `best_ask`) raises
+`BookInvalidError` while the book is out of sync.
+
+**Why:** two guards that do not depend on each other. Gaps are a *normal*
+operating condition per Phase 7, so raising would mean exceptions for ordinary
+control flow. But a returned status the caller ignores is exactly the silent
+corruption the project exists to avoid — so ignoring it costs an error at read
+time instead of plausible-looking wrong numbers.
+
+**Rejected — raise on gap:** makes every call site a try/except for something
+that happens routinely.
+
+**Rejected — status only, reads always served:** one forgotten `if` and the
+book serves numbers from a state it knows is wrong.
+
+**Consequence:** callers must handle `BookInvalidError`, including the Phase 10
+API, which needs to translate it into a meaningful status rather than a 500.
+
+---
+
 ## 2026-09-02 — Prices and quantities are `Decimal`
 
 **Decision:** `BookUpdate` carries price and quantity as `decimal.Decimal`.

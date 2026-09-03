@@ -64,14 +64,13 @@ architectural boundaries, domain rules, non-obvious interactions.
 | --- | --- |
 | Install | _TBD — set at first environment setup_ |
 | Run | _TBD_ |
-| Test | `pytest` |
-| Docs link check | `bash tools/check-docs.sh` |
+| Test | `uv run pytest` |
 | Lint / format | _TBD_ |
 
 ## Verify before finishing
 
 ```
-pytest
+uv run pytest
 ```
 
 Never claim work is correct without running it. Paste the output.

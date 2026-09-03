@@ -41,3 +41,37 @@ class BookUpdate:
     last_seq: int
     bids: tuple[PriceLevel, ...]
     asks: tuple[PriceLevel, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BookSnapshot:
+    """Complete book state at a single sequence number.
+
+    Unlike `BookUpdate` this carries no range: a snapshot is the whole book as
+    of `last_seq`, not a change covering a span. It is modelled as an event so
+    that replay can replay a resynchronisation, which a direct method call on
+    the book could not.
+
+    Attributes:
+        exchange: Origin venue.
+        symbol: Venue-neutral instrument identifier.
+        timestamp_ns: Exchange time if the venue supplies one. REST snapshot
+            endpoints typically do not, in which case this mirrors
+            `received_ns` -- see the adapter that produced it.
+        received_ns: Local receive time, nanoseconds.
+        last_seq: The sequence number this state is current as of.
+        bids: Complete bid side, to whatever depth was requested.
+        asks: Complete ask side.
+    """
+
+    exchange: str
+    symbol: str
+    timestamp_ns: int
+    received_ns: int
+    last_seq: int
+    bids: tuple[PriceLevel, ...]
+    asks: tuple[PriceLevel, ...]
+
+
+MarketEvent = BookUpdate | BookSnapshot
+"""Anything the pipeline carries. Widen as event types are added."""
