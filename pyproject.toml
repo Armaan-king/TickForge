@@ -9,6 +9,8 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
+    "polars>=1.44.1",
+    "pyarrow>=25.0.1",
     "websockets>=17.1",
 ]
 

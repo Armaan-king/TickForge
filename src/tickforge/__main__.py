@@ -5,22 +5,27 @@ order book and analytics -- against the real exchange::
 
     uv run python -m tickforge
     uv run python -m tickforge ETHUSDT 60
+    uv run python -m tickforge BTCUSDT 600 data     <- also record to Parquet
 
 Not a test: it needs the network and it prints rather than asserts. Its job is
 to surface what only appears against a live venue -- whether microprice
 actually leads price, whether imbalance moves before the touch does, and
 whether any of it survives a real resync.
+
+With a data directory it doubles as the capture tool. Recording tees the feed,
+so what lands on disk is the event stream exactly as emitted -- before the book
+or the analytics touch it, which is what makes it replayable.
 """
 
 import asyncio
 import sys
-
 from decimal import Decimal
 
 from tickforge.adapters.binance_feed import BinanceFeed
 from tickforge.analytics import FlowFeatures, imbalance, microprice, midprice
 from tickforge.book import ApplyResult, OrderBook
 from tickforge.events import BookSnapshot, Trade
+from tickforge.storage import EventStore, record
 
 WINDOW_NS = 60 * 1_000_000_000
 
@@ -30,7 +35,7 @@ def show(value: Decimal | None, spec: str) -> str:
     return "--".rjust(len(format(Decimal(0), spec))) if value is None else format(value, spec)
 
 
-async def watch(symbol: str, duration_s: float) -> None:
+async def watch(symbol: str, duration_s: float, data_root: str | None = None) -> None:
     book = OrderBook("binance", symbol.upper())
     flow = FlowFeatures(WINDOW_NS)
     feed = BinanceFeed(symbol)
@@ -38,9 +43,14 @@ async def watch(symbol: str, duration_s: float) -> None:
     snapshots = 0
     trades = 0
 
+    store = None if data_root is None else EventStore(data_root, "binance", symbol.upper())
+    # Teed at the feed, so the recording is the raw emitted stream rather than
+    # whatever survived this loop's control flow.
+    source = feed.run() if store is None else record(feed.run(), store)
+
     try:
         async with asyncio.timeout(duration_s):
-            async for event in feed.run():
+            async for event in source:
                 events += 1
 
                 if isinstance(event, BookSnapshot):
@@ -95,18 +105,26 @@ async def watch(symbol: str, duration_s: float) -> None:
                 )
     except TimeoutError:
         pass
+    finally:
+        # Closes the Parquet footers. Without them the files hold rows nobody
+        # can read, so this has to survive the timeout and a Ctrl-C alike.
+        if store is not None:
+            store.close()
 
     print(
         f"\n{events} events, {trades} trade(s), {snapshots} snapshot(s) "
         f"--> more than one snapshot means a resync"
     )
+    if store is not None:
+        print(f"recorded to {data_root}/binance/{symbol.upper()}/")
 
 
 def main() -> None:
     symbol = sys.argv[1] if len(sys.argv) > 1 else "BTCUSDT"
     duration_s = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
+    data_root = sys.argv[3] if len(sys.argv) > 3 else None
     try:
-        asyncio.run(watch(symbol, duration_s))
+        asyncio.run(watch(symbol, duration_s, data_root))
     except KeyboardInterrupt:
         pass
 
