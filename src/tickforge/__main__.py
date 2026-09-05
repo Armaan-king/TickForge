@@ -22,7 +22,7 @@ import sys
 from decimal import Decimal
 
 from tickforge.adapters.binance_feed import BinanceFeed
-from tickforge.analytics import FlowFeatures, imbalance, microprice, midprice
+from tickforge.analytics import FlowFeatures, feature_snapshot
 from tickforge.book import ApplyResult, OrderBook
 from tickforge.events import BookSnapshot, Trade
 from tickforge.storage import EventStore, record
@@ -84,24 +84,30 @@ async def watch(symbol: str, duration_s: float, data_root: str | None = None) ->
 
                 flow.observe(event, book)
 
-                mid = midprice(book)
-                if mid is None:
+                # Computed once, then both printed and stored -- so what lands
+                # in features.parquet is exactly what you watched go past.
+                f = feature_snapshot(book, flow, event.timestamp_ns)
+                if store is not None:
+                    store.write_features(f)
+
+                if f.midprice is None:
                     continue
-                vwap = flow.vwap
-                rvol = flow.realised_volatility
+                mid = f.midprice
+                # Scaled to basis points: realised vol over 60s on a liquid
+                # pair is ~1e-5, which prints as 0.00 in fixed notation.
+                rv_bp = None if f.realised_volatility is None else f.realised_volatility * 10000
+                vwap_offset = None if f.vwap is None else f.vwap - mid
                 print(
                     f"mid {mid:.2f} "
                     # Offsets, not absolutes: microprice tracks mid to within a
                     # tick and VWAP to within a few, so the lean is the signal.
-                    f"micro {microprice(book) - mid:+.4f} | "
-                    f"L1 {imbalance(book, 1):+.2f} "
-                    f"L5 {imbalance(book, 5):+.2f} | "
-                    f"ofi {show(flow.order_flow_imbalance, '+8.3f')} "
-                    f"tImb {show(flow.trade_imbalance, '+.2f')} "
-                    f"vwap {show(None if vwap is None else vwap - mid, '+8.2f')} "
-                    # Scaled to basis points: realised vol over 60s on a liquid
-                    # pair is ~1e-5, which prints as 0.00 in fixed notation.
-                    f"rv {show(None if rvol is None else rvol * 10000, '.2f')}bp"
+                    f"micro {f.microprice - mid:+.4f} | "
+                    f"L1 {f.imbalance_1:+.2f} "
+                    f"L5 {f.imbalance_5:+.2f} | "
+                    f"ofi {show(f.order_flow_imbalance, '+8.3f')} "
+                    f"tImb {show(f.trade_imbalance, '+.2f')} "
+                    f"vwap {show(vwap_offset, '+8.2f')} "
+                    f"rv {show(rv_bp, '.2f')}bp"
                 )
     except TimeoutError:
         pass

@@ -10,7 +10,15 @@ from decimal import Decimal
 
 import pytest
 
-from tickforge.analytics import imbalance, market_depth, microprice, midprice, spread
+from tickforge.analytics import (
+    FlowFeatures,
+    feature_snapshot,
+    imbalance,
+    market_depth,
+    microprice,
+    midprice,
+    spread,
+)
 from tickforge.book import BookInvalidError, OrderBook
 from tickforge.events import BookSnapshot, BookUpdate
 
@@ -153,6 +161,51 @@ def test_empty_book_has_no_imbalance() -> None:
     """Nothing resting on either side: the ratio is undefined, not zero.
     Returning zero would read downstream as 'perfectly balanced'."""
     assert imbalance(book(bids=(), asks=()), 3) is None
+
+
+# --- failing closed ---------------------------------------------------------
+
+
+# --- the combined snapshot --------------------------------------------------
+
+WINDOW = 60 * 1_000_000_000
+
+
+def test_snapshot_agrees_with_the_individual_functions() -> None:
+    """One row must not be a second, drifting implementation of the features."""
+    b = book()
+    snap = feature_snapshot(b, FlowFeatures(WINDOW), 12345)
+
+    assert snap.timestamp_ns == 12345
+    assert snap.best_bid == b.best_bid
+    assert snap.spread == spread(b)
+    assert snap.midprice == midprice(b)
+    assert snap.microprice == microprice(b)
+    assert snap.imbalance_1 == imbalance(b, 1)
+    assert snap.imbalance_5 == imbalance(b, 5)
+    assert (snap.bid_depth_10, snap.ask_depth_10) == market_depth(b, 10)
+
+
+def test_snapshot_carries_undefined_features_through_as_none() -> None:
+    """A one-sided book has no midprice and a fresh window no VWAP -- but a
+    one-sided book *does* have an imbalance, and it saturates rather than
+    going unknown. The snapshot must not flatten that distinction."""
+    snap = feature_snapshot(book(asks=()), FlowFeatures(WINDOW), 1)
+
+    assert snap.midprice is None
+    assert snap.microprice is None
+    assert snap.spread is None
+    assert snap.vwap is None
+    assert snap.realised_volatility is None
+    assert snap.imbalance_10 == Decimal("1")
+    assert snap.order_flow_imbalance == Decimal("0")
+
+
+def test_snapshot_refuses_an_invalid_book() -> None:
+    """A feature row from a corrupt book is the plausible-wrong-number failure
+    the whole project is arranged around. It must not be storable."""
+    with pytest.raises(BookInvalidError):
+        feature_snapshot(invalid_book(), FlowFeatures(WINDOW), 1)
 
 
 # --- failing closed ---------------------------------------------------------

@@ -7,14 +7,16 @@ and quietly discard the guarantee the project is built on.
 
 import asyncio
 import functools
+from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 
+from tickforge.analytics import FeatureSnapshot
 from tickforge.events import BookSnapshot, BookUpdate, Side, Trade
-from tickforge.storage import EventStore, record
+from tickforge.storage import FEATURE_SCHEMA, EventStore, record
 
 DAY_NS = 24 * 60 * 60 * 1_000_000_000
 T0 = 1_788_307_200_000_000_000  # 2026-09-02 00:00:00 UTC
@@ -227,6 +229,107 @@ async def test_record_preserves_order(tmp_path) -> None:
             pass
 
     assert [row["first_seq"] for row in read(tmp_path, "book_updates")] == list(range(10))
+
+
+# --- the footer -------------------------------------------------------------
+
+
+# --- features ---------------------------------------------------------------
+
+
+def features(at=T0, **overrides) -> FeatureSnapshot:
+    """A snapshot with everything populated, so overrides can blank one field."""
+    defaults = dict(
+        timestamp_ns=at,
+        best_bid=Decimal("100"),
+        best_ask=Decimal("101"),
+        spread=Decimal("1"),
+        midprice=Decimal("100.5"),
+        microprice=Decimal("100.25"),
+        imbalance_1=Decimal("-0.5"),
+        imbalance_5=Decimal("-0.2"),
+        imbalance_10=Decimal("0"),
+        bid_depth_10=Decimal("16"),
+        ask_depth_10=Decimal("16"),
+        vwap=Decimal("100.4"),
+        trade_imbalance=Decimal("0.5"),
+        order_flow_imbalance=Decimal("4"),
+        realised_volatility=Decimal("0.00248"),
+    )
+    return FeatureSnapshot(**{**defaults, **overrides})
+
+
+def test_the_schema_matches_the_dataclass(tmp_path) -> None:
+    """A new feature must reach storage by being added in one place.
+
+    Without this, adding a field to FeatureSnapshot silently drops it: the
+    extra key is ignored against an explicit Arrow schema, so nothing fails
+    and the column simply never appears.
+    """
+    from_schema = set(FEATURE_SCHEMA.names) - {"exchange", "symbol"}
+    assert from_schema == {field.name for field in fields(FeatureSnapshot)}
+
+
+def test_features_round_trip(tmp_path) -> None:
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write_features(features())
+
+    row = read(tmp_path, "features")[0]
+    assert row["midprice"] == Decimal("100.5")
+    assert row["imbalance_1"] == Decimal("-0.5")
+    assert row["order_flow_imbalance"] == Decimal("4")
+    assert row["timestamp_ns"] == T0
+
+
+def test_a_missing_feature_stays_null_rather_than_zero(tmp_path) -> None:
+    """The distinction the nullable columns exist for.
+
+    An empty window has no VWAP and a resync leaves no order flow. Writing
+    those as zero would read downstream as "traded at zero" and "perfectly
+    balanced" -- both plausible, both wrong.
+    """
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write_features(features(vwap=None, order_flow_imbalance=None))
+
+    row = read(tmp_path, "features")[0]
+    assert row["vwap"] is None
+    assert row["order_flow_imbalance"] is None
+    assert row["midprice"] == Decimal("100.5")  # its neighbours are unaffected
+
+
+def test_a_division_result_is_rounded_rather_than_rejected(tmp_path) -> None:
+    """Dividing Decimals gives 28 significant digits -- 29 decimal places here
+    -- and pyarrow refuses to rescale rather than truncating silently. So the
+    rounding happens explicitly on the way in.
+    """
+    ratio = (Decimal(12) - Decimal(14)) / (Decimal(12) + Decimal(14))
+    assert -ratio.as_tuple().exponent == 29  # too many places for the column
+
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write_features(features(imbalance_5=ratio))
+
+    stored = read(tmp_path, "features")[0]["imbalance_5"]
+    assert stored == ratio.quantize(Decimal("1e-18"))
+    assert abs(stored - ratio) < Decimal("1e-18")
+
+
+def test_features_are_a_separate_stream(tmp_path) -> None:
+    """Derived rows never mix with the raw stream replay reproduces."""
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write(update())
+        store.write_features(features())
+
+    assert len(read(tmp_path, "features")) == 1
+    assert len(read(tmp_path, "book_updates")) == 1
+
+
+def test_features_roll_partitions_on_event_time(tmp_path) -> None:
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write_features(features(at=T0))
+        store.write_features(features(at=T0 + DAY_NS))
+
+    assert len(read(tmp_path, "features", DAY)) == 1
+    assert len(read(tmp_path, "features", NEXT_DAY)) == 1
 
 
 # --- the footer -------------------------------------------------------------

@@ -15,6 +15,7 @@ that clock is event time, never wall time. See its docstring.
 """
 
 from collections import deque
+from dataclasses import dataclass
 from decimal import Decimal
 
 from tickforge.book import OrderBook
@@ -305,6 +306,82 @@ class FlowFeatures:
         if self._holed or not self._returns:
             return None
         return sum((r for _, r in self._returns), Decimal(0)).sqrt()
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureSnapshot:
+    """Every Phase 4 feature, as of one instant.
+
+    Derived output, not a market event -- deliberately outside `MarketEvent`
+    and outside `events.py`. An adapter produces events; this is what the
+    analytics layer produces *from* them, and conflating the two would put a
+    computed value into the stream replay is supposed to reproduce exactly.
+
+    Almost everything is nullable, and the nulls mean different things: a
+    one-sided book has no midprice, an empty window has no VWAP, and a window
+    spanning a resync has no order flow. None is "not defined here", never
+    zero.
+
+    Attributes:
+        timestamp_ns: Event time of the update this was computed from. Not a
+            wall clock, so a replay reproduces the same timestamps.
+        bid_depth_10: Resting size in the top 10 bid levels. Not nullable --
+            an empty side is genuinely zero size, unlike an undefined ratio.
+    """
+
+    timestamp_ns: int
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+    spread: Decimal | None
+    midprice: Decimal | None
+    microprice: Decimal | None
+    imbalance_1: Decimal | None
+    imbalance_5: Decimal | None
+    imbalance_10: Decimal | None
+    bid_depth_10: Decimal
+    ask_depth_10: Decimal
+    vwap: Decimal | None
+    trade_imbalance: Decimal | None
+    order_flow_imbalance: Decimal | None
+    realised_volatility: Decimal | None
+
+
+def feature_snapshot(
+    book: OrderBook, flow: FlowFeatures, timestamp_ns: int
+) -> FeatureSnapshot:
+    """Compute every feature at once, for storage or display.
+
+    Args:
+        timestamp_ns: Taken from the event that triggered this, not from a
+            clock. Everything else is read from the book and the window.
+
+    Returns:
+        A `FeatureSnapshot`. Nothing is mutated -- the book and the window are
+        read only, as `architecture.md` requires of feature code.
+
+    Raises:
+        BookInvalidError: The book is out of sync. Call this only after an
+            update applied cleanly; a feature row computed from a corrupt book
+            is the plausible-wrong-number failure the project exists to avoid.
+    """
+    bid_depth, ask_depth = market_depth(book, 10)
+    return FeatureSnapshot(
+        timestamp_ns=timestamp_ns,
+        best_bid=book.best_bid,
+        best_ask=book.best_ask,
+        spread=spread(book),
+        midprice=midprice(book),
+        microprice=microprice(book),
+        imbalance_1=imbalance(book, 1),
+        imbalance_5=imbalance(book, 5),
+        imbalance_10=imbalance(book, 10),
+        bid_depth_10=bid_depth,
+        ask_depth_10=ask_depth,
+        vwap=flow.vwap,
+        trade_imbalance=flow.trade_imbalance,
+        order_flow_imbalance=flow.order_flow_imbalance,
+        realised_volatility=flow.realised_volatility,
+    )
 
 
 def _order_flow(prev: L1, current: L1) -> Decimal:

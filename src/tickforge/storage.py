@@ -11,12 +11,14 @@ docs/superpowers/specs/2026-09-05-parquet-storage-design.md
 
 import datetime as dt
 from collections.abc import AsyncIterator
+from dataclasses import fields
 from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tickforge.analytics import FeatureSnapshot
 from tickforge.events import BookSnapshot, MarketEvent, PriceLevel, Trade
 
 NS_PER_SECOND = 1_000_000_000
@@ -115,10 +117,55 @@ def _levels(levels: tuple[PriceLevel, ...]) -> list[dict[str, Decimal]]:
     return [{"price": price, "quantity": quantity} for price, quantity in levels]
 
 
+FEATURE_SCHEMA = pa.schema(
+    _IDENTITY
+    + [("timestamp_ns", pa.int64())]
+    + [
+        (name, PRICE)
+        for name in (
+            "best_bid",
+            "best_ask",
+            "spread",
+            "midprice",
+            "microprice",
+            "imbalance_1",
+            "imbalance_5",
+            "imbalance_10",
+            "bid_depth_10",
+            "ask_depth_10",
+            "vwap",
+            "trade_imbalance",
+            "order_flow_imbalance",
+            "realised_volatility",
+        )
+    ]
+)
+"""Derived features. No `received_ns`: a feature was never received.
+
+Every column is nullable, and the nulls carry meaning -- a one-sided book has
+no midprice, an empty window no VWAP, a window spanning a resync no order
+flow. Reading a null as zero would turn "undefined" into "balanced".
+"""
+
+SCALE = Decimal("1e-18")
+"""What derived values are rounded to before storage.
+
+Dividing Decimals yields 28 *significant* digits -- an imbalance of
+``(12-14)/26`` has 29 decimal places -- and pyarrow refuses to rescale into
+decimal128(38,18) rather than truncate silently, which is the behaviour you
+want. So the rounding is done here, explicitly.
+
+Lossy, and acceptable only for *derived* values: features can always be
+recomputed from the raw events, which are stored exactly. The same rounding
+applied to a traded price would be unrecoverable, which is why raw events
+never pass through here.
+"""
+
 STREAMS = {
     "trades": TRADE_SCHEMA,
     "book_updates": UPDATE_SCHEMA,
     "snapshots": SNAPSHOT_SCHEMA,
+    "features": FEATURE_SCHEMA,
 }
 """File name to schema. One Parquet file per stream per partition."""
 
@@ -176,19 +223,33 @@ class EventStore:
         self.close()
 
     def write(self, event: MarketEvent) -> None:
-        """Buffer one event, rolling the partition and flushing as needed."""
-        date = _date_of(event.timestamp_ns)
+        """Buffer one raw event, rolling the partition and flushing as needed."""
+        stream, row = self._row(event)
+        self._append(stream, row, event.timestamp_ns)
+
+    def write_features(self, features: FeatureSnapshot) -> None:
+        """Buffer one computed feature row.
+
+        Separate from `write` because a `FeatureSnapshot` is not a market
+        event: `record` tees the raw stream and must not carry derived values
+        into what replay is meant to reproduce. Only the component that
+        computed the features has them, so this is called directly.
+        """
+        self._append("features", self._feature_row(features), features.timestamp_ns)
+
+    def _append(self, stream: str, row: dict, timestamp_ns: int) -> None:
+        """Roll the partition if the day changed, buffer, flush if due."""
+        date = _date_of(timestamp_ns)
         if date != self._date:
             self._roll(date)
         if self._last_flush_ns is None:
-            self._last_flush_ns = event.timestamp_ns
+            self._last_flush_ns = timestamp_ns
 
-        stream, row = self._row(event)
         self._buffers[stream].append(row)
 
-        if self._due(event.timestamp_ns):
+        if self._due(timestamp_ns):
             self.flush()
-            self._last_flush_ns = event.timestamp_ns
+            self._last_flush_ns = timestamp_ns
 
     def flush(self) -> None:
         """Write every buffered row out as a row group."""
@@ -205,7 +266,10 @@ class EventStore:
         self._close_writers()
 
     def _row(self, event: MarketEvent) -> tuple[str, dict]:
-        """Which stream this event belongs to, and its row."""
+        """Which stream this event belongs to, and its row.
+
+        Raw events are written verbatim -- no rounding anywhere on this path.
+        """
         common = {
             "exchange": self._exchange,
             "symbol": self._symbol,
@@ -235,6 +299,24 @@ class EventStore:
             "bids": _levels(event.bids),
             "asks": _levels(event.asks),
         }
+
+    def _feature_row(self, features: FeatureSnapshot) -> dict:
+        """Round every derived value to the stored scale.
+
+        Driven off the dataclass rather than a hand-written column list, so a
+        new feature reaches storage by being added in one place.
+        """
+        row: dict = {
+            "exchange": self._exchange,
+            "symbol": self._symbol,
+            "timestamp_ns": features.timestamp_ns,
+        }
+        for field in fields(features):
+            if field.name == "timestamp_ns":
+                continue
+            value = getattr(features, field.name)
+            row[field.name] = None if value is None else value.quantize(SCALE)
+        return row
 
     def _due(self, now_ns: int) -> bool:
         """Whether either bound has been reached."""
