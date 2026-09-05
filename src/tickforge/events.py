@@ -90,7 +90,7 @@ class BookSnapshot:
 @dataclass(frozen=True, slots=True)
 class Trade:
     """A single execution.
-
+    
     Not book state. A trade carries no sequence range and no contiguity
     requirement, because a missed trade cannot corrupt anything the way a
     missed book update can -- it is simply lost. Nothing downstream needs to

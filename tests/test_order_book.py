@@ -182,3 +182,69 @@ def test_reads_fail_closed_when_invalid() -> None:
 def test_unseeded_book_refuses_reads() -> None:
     with pytest.raises(BookInvalidError, match="EMPTY"):
         _ = OrderBook("test", "TEST").best_bid
+
+
+# --- depth access -----------------------------------------------------------
+
+DEEP = (
+    ("99", "3"),
+    ("101", "1"),
+    ("97", "5"),
+    ("100", "2"),
+    ("98", "4"),
+)
+"""Deliberately unsorted. A dict preserves insertion order, so a method that
+forgot to sort would still look right if the fixture arrived sorted."""
+
+
+def test_top_bids_are_ordered_best_first() -> None:
+    book = seeded(100, bids=DEEP, asks=(("200", "1"),))
+
+    top = book.top_bids(3)
+
+    assert [price for price, _ in top] == [Decimal("101"), Decimal("100"), Decimal("99")]
+    assert top[0] == (book.best_bid, Decimal("1"))
+
+
+def test_top_asks_are_ordered_best_first() -> None:
+    """The mirror matters: one side returned in the wrong direction is
+    invisible until an imbalance number comes out inverted."""
+    book = seeded(100, bids=(("1", "1"),), asks=DEEP)
+
+    top = book.top_asks(3)
+
+    assert [price for price, _ in top] == [Decimal("97"), Decimal("98"), Decimal("99")]
+    assert top[0] == (book.best_ask, Decimal("5"))
+
+
+def test_quantities_travel_with_their_price() -> None:
+    """An off-by-one between the price list and the quantity lookup would
+    still produce a plausibly ordered book."""
+    book = seeded(100, bids=DEEP, asks=(("200", "1"),))
+
+    assert book.top_bids(5) == (
+        (Decimal("101"), Decimal("1")),
+        (Decimal("100"), Decimal("2")),
+        (Decimal("99"), Decimal("3")),
+        (Decimal("98"), Decimal("4")),
+        (Decimal("97"), Decimal("5")),
+    )
+
+
+def test_asking_for_more_levels_than_exist() -> None:
+    """A thin book returns what it has rather than padding or raising."""
+    book = seeded(100, bids=(("100", "1"), ("99", "1")))
+
+    assert len(book.top_bids(10)) == 2
+
+
+def test_depth_reads_fail_closed() -> None:
+    """The reason depth lives on the book and not in the analytics layer:
+    serving levels from an INVALID book is the unrecoverable failure."""
+    book = seeded(100, bids=DEEP, asks=(("200", "1"),))
+    book.apply(update(107, 110))
+
+    with pytest.raises(BookInvalidError):
+        book.top_bids(5)
+    with pytest.raises(BookInvalidError):
+        book.top_asks(5)

@@ -5,6 +5,7 @@ of any exchange. That is what makes it testable without a connection and
 identical under live and replay -- see docs/knowledge/architecture.md.
 """
 
+import heapq
 from decimal import Decimal
 from enum import Enum, auto
 
@@ -162,6 +163,36 @@ class OrderBook:
     def best_ask(self) -> Decimal | None:
         self._require_valid()
         return min(self._asks) if self._asks else None
+
+    def top_bids(self, n: int) -> tuple[PriceLevel, ...]:
+        """The `n` bid levels nearest the spread, highest price first.
+
+        Returns fewer than `n` entries when the book holds fewer. A thin book
+        is not an error, but a feature averaged over it is measuring something
+        narrower than it claims, so a caller that cares must check the length.
+
+        Raises:
+            BookInvalidError: The book is not in sync.
+        """
+        self._require_valid()
+        # ponytail: O(n log k) per call. Cheaper than sorting all levels, and
+        # if Phase 9 shows it dominating, keep the two sides sorted instead.
+        prices = heapq.nlargest(n, self._bids)
+        return tuple((price, self._bids[price]) for price in prices)
+
+    def top_asks(self, n: int) -> tuple[PriceLevel, ...]:
+        """The `n` ask levels nearest the spread, lowest price first.
+
+        Mirror of `top_bids`. Both are best-first so that a feature computed
+        over one side is symmetric with the other -- imbalance never has to
+        know which side it is looking at.
+
+        Raises:
+            BookInvalidError: The book is not in sync.
+        """
+        self._require_valid()
+        prices = heapq.nsmallest(n, self._asks)
+        return tuple((price, self._asks[price]) for price in prices)
 
     def _require_valid(self) -> None:
         if not self.is_valid:
