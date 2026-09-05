@@ -1,4 +1,4 @@
-"""Binance feed: the snapshot/buffer join, and the snapshot request itself.
+﻿"""Binance feed: the snapshot/buffer join, and the snapshot request itself.
 
 No network. The join needs only sequence numbers, so its events carry no
 levels; the HTTP layer runs against a real `httpx` client with a fake socket.
@@ -8,6 +8,7 @@ import asyncio
 import functools
 import time
 from collections.abc import AsyncGenerator, Sequence
+from decimal import Decimal
 from types import SimpleNamespace
 
 import httpx
@@ -22,7 +23,7 @@ from tickforge.adapters.binance_feed import (
     fetch_snapshot,
     updates_after_snapshot,
 )
-from tickforge.events import BookSnapshot, BookUpdate
+from tickforge.events import BookSnapshot, BookUpdate, Side, Trade
 
 
 def async_test(fn):
@@ -50,6 +51,13 @@ def update(first_seq: int, last_seq: int) -> BookUpdate:
 
 def snapshot(last_seq: int) -> BookSnapshot:
     return BookSnapshot("binance", "BTCUSDT", 0, 0, last_seq, (), ())
+
+
+def trade(trade_id: int) -> Trade:
+    """Price and quantity are placeholders -- the feed never looks at them."""
+    return Trade(
+        "binance", "BTCUSDT", 0, 0, Decimal("1"), Decimal("1"), trade_id, Side.BUY
+    )
 
 
 def test_updates_entirely_before_the_snapshot_are_dropped() -> None:
@@ -400,7 +408,7 @@ async def test_sync_once_emits_the_snapshot_then_every_update(monkeypatch) -> No
     the rest in order. Where the buffered updates end and the live ones begin
     is invisible downstream, which is what makes the stream replayable."""
     script = [update(101, 110), update(111, 120), update(121, 130), update(131, 140)]
-    monkeypatch.setattr(binance_feed, "stream_updates", FakeStream(script))
+    monkeypatch.setattr(binance_feed, "stream_events", FakeStream(script))
     monkeypatch.setattr(
         binance_feed, "fetch_snapshot", FakeFetch(snapshot(100), hops=0)
     )
@@ -422,7 +430,7 @@ async def test_sync_once_rejects_an_overlapping_update(monkeypatch) -> None:
     unaware. Being laxer than the book is silent death.
     """
     script = [update(101, 110), update(111, 120), update(118, 135)]
-    monkeypatch.setattr(binance_feed, "stream_updates", FakeStream(script))
+    monkeypatch.setattr(binance_feed, "stream_events", FakeStream(script))
     monkeypatch.setattr(
         binance_feed, "fetch_snapshot", FakeFetch(snapshot(100), hops=0)
     )
@@ -441,7 +449,7 @@ async def test_sync_once_rejects_a_gap_inside_the_buffered_window(monkeypatch) -
     """
     monkeypatch.setattr(
         binance_feed,
-        "stream_updates",
+        "stream_events",
         FakeStream([update(101, 110), update(121, 130)]),
     )
     # Slow enough that both updates land in the buffer, so the live loop never
@@ -464,7 +472,7 @@ async def test_sync_once_accepts_a_spanning_update_after_an_empty_join(
     and rebuild forever -- the trap the book's SEEDED state exists to avoid.
     """
     script = [update(90, 95), update(96, 99), update(98, 115), update(116, 120)]
-    monkeypatch.setattr(binance_feed, "stream_updates", FakeStream(script))
+    monkeypatch.setattr(binance_feed, "stream_events", FakeStream(script))
     monkeypatch.setattr(
         binance_feed, "fetch_snapshot", FakeFetch(snapshot(100), hops=0)
     )
@@ -476,11 +484,60 @@ async def test_sync_once_accepts_a_spanning_update_after_an_empty_join(
 
 
 @async_test
+async def test_trades_pass_through_without_a_sequence_check(monkeypatch) -> None:
+    """A trade between two contiguous updates must not break the chain.
+
+    Trades carry no sequence numbers at all, so a loop that checked every
+    event uniformly would either raise on the missing `last_seq` or read the
+    trade as a gap and resync on every execution.
+    """
+    script = [update(101, 110), update(111, 120), trade(1), update(121, 130)]
+    monkeypatch.setattr(binance_feed, "stream_events", FakeStream(script))
+    monkeypatch.setattr(
+        binance_feed, "fetch_snapshot", FakeFetch(snapshot(100), hops=0)
+    )
+
+    events = await collect(BinanceFeed("BTCUSDT")._sync_once(None), 5)
+
+    assert [type(e) for e in events] == [
+        BookSnapshot,
+        BookUpdate,
+        BookUpdate,
+        Trade,
+        BookUpdate,
+    ]
+
+
+@async_test
+async def test_trades_buffered_during_seeding_are_not_lost(monkeypatch) -> None:
+    """They arrived on a live socket and describe real executions.
+
+    Dropping them would punch a hole in trade flow at startup and after every
+    single resync -- exactly the windows where the market is most interesting.
+    """
+    script = [trade(1), update(101, 110), update(111, 120)]
+    monkeypatch.setattr(binance_feed, "stream_events", FakeStream(script))
+    # Slow enough that the whole script lands in the buffer.
+    monkeypatch.setattr(
+        binance_feed, "fetch_snapshot", FakeFetch(snapshot(100), hops=10)
+    )
+
+    events = await collect(BinanceFeed("BTCUSDT")._sync_once(None), 4)
+
+    assert [type(e) for e in events] == [
+        BookSnapshot,
+        Trade,
+        BookUpdate,
+        BookUpdate,
+    ]
+
+
+@async_test
 async def test_sync_once_closes_the_stream_when_it_fails(monkeypatch) -> None:
     """The socket lives inside the generator, so only closing it releases the
     connection. A resync loop leaking one per attempt would run out."""
     stream = FakeStream([update(101, 110), update(121, 130)])
-    monkeypatch.setattr(binance_feed, "stream_updates", stream)
+    monkeypatch.setattr(binance_feed, "stream_events", stream)
     monkeypatch.setattr(
         binance_feed, "fetch_snapshot", FakeFetch(snapshot(100), hops=10)
     )
@@ -506,7 +563,7 @@ async def test_run_resynchronises_after_a_gap(monkeypatch) -> None:
         [update(101, 110), update(121, 130)],  # 111-120 never arrived
         [update(201, 210), update(211, 220)],  # clean second attempt
     )
-    monkeypatch.setattr(binance_feed, "stream_updates", stream)
+    monkeypatch.setattr(binance_feed, "stream_events", stream)
     monkeypatch.setattr(
         binance_feed,
         "fetch_snapshot",
@@ -550,7 +607,7 @@ async def test_run_waits_before_reconnecting_on_a_clean_close(monkeypatch) -> No
         ),
     )
     stream = FakeStream([update(101, 110), update(111, 120)])
-    monkeypatch.setattr(binance_feed, "stream_updates", stream)
+    monkeypatch.setattr(binance_feed, "stream_events", stream)
     monkeypatch.setattr(
         binance_feed,
         "fetch_snapshot",

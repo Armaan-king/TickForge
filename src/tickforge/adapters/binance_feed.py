@@ -14,10 +14,10 @@ import httpx
 import websockets
 from websockets.exceptions import WebSocketException
 
-from tickforge.adapters.binance import SNAPSHOT_URL, parse_depth_update, parse_snapshot
-from tickforge.events import BookSnapshot, BookUpdate, MarketEvent
+from tickforge.adapters.binance import SNAPSHOT_URL, parse_snapshot, parse_stream_frame
+from tickforge.events import BookSnapshot, BookUpdate, MarketEvent, Trade
 
-STREAM_URL="wss://stream.binance.com:9443/ws"
+STREAM_URL = "wss://stream.binance.com:9443/stream"
 RESYNC_DELAY_S = 1.0
 """Pause before rebuilding. Connection health only -- never affects output."""
 
@@ -87,22 +87,30 @@ async def fetch_snapshot(client: httpx.AsyncClient, symbol: str, limit: int=1000
         received_ns=received_ns
     )
 
-async def stream_updates(symbol:str)->AsyncIterator[BookUpdate]:
-    """Yield normalized depth updates from Binance's WebSocket stream.
+async def stream_events(symbol:str)->AsyncIterator[BookUpdate | Trade]:
+    """Yield normalized depth updates and trades from Binance's WebSocket.
 
     Yields:
-        One `BookUpdate` per frame, stamped with the moment it arrived.
+        One `BookUpdate` or `Trade` per frame, stamped with the moment it
+        arrived, interleaved exactly as the venue sent them.
+
+    Both subscriptions share one socket. Two connections would mean inventing
+    an ordering between trades and depth updates that the exchange never
+    stated, and Phase 4 reads trade flow against book state -- so that
+    ordering has to come from the venue, not from whichever `asyncio` task
+    happened to be scheduled first.
 
     The socket lives inside this generator, so it stays open while the
     generator is merely paused and closes when the generator is closed. One
     connection only: reconnection means the book is stale, which is the
     coordinator's problem, not this function's.
     """
-    new_url=f"{STREAM_URL}/{symbol.lower()}@depth"
+    symbol=symbol.lower()
+    new_url=f"{STREAM_URL}?streams={symbol}@depth/{symbol}@trade"
     async with websockets.connect(new_url) as ws:
         async for message in ws:
             received_ns=time.time_ns()
-            yield parse_depth_update(message,received_ns=received_ns)
+            yield parse_stream_frame(message,received_ns=received_ns)
 
 class BinanceFeed:
     """Maintains a synchronized Binance depth feed for one symbol.
@@ -151,20 +159,34 @@ class BinanceFeed:
         """One synchronised session: seed, join, then stream until it breaks.
 
         Yields:
-            Exactly one `BookSnapshot`, then `BookUpdate`s in sequence order.
-            A session normally ends by raising; a clean socket close ends it
-            without one.
+            Exactly one `BookSnapshot`, then `BookUpdate`s in sequence order
+            with `Trade`s interleaved. A session normally ends by raising; a
+            clean socket close ends it without one.
 
         Raises:
             ResyncRequired: Synchronisation was lost and cannot be recovered
                 without a new snapshot.
         """
-        stream = stream_updates(self.symbol)
+        stream = stream_events(self.symbol)
         try:
             snapshot, buffered = await self._seed(client, stream)
-            joined = updates_after_snapshot(snapshot, buffered)
+            # Trades have no sequence relationship to the snapshot, so they
+            # are neither filtered against it nor checked for contiguity.
+            trades = [e for e in buffered if isinstance(e, Trade)]
+            joined = updates_after_snapshot(
+                snapshot, [e for e in buffered if isinstance(e, BookUpdate)]
+            )
 
             yield snapshot
+
+            # Emitted as a block rather than in arrival order. Nothing
+            # downstream can observe the difference -- a trade is not ordered
+            # against a sequence number -- and it only affects the one-second
+            # seeding window. Interleaving them properly would mean tracking
+            # each update's position in `buffered` for no gain.
+            for trade in trades:
+                yield trade
+
             last_seq = snapshot.last_seq
             synced = False
 
@@ -178,12 +200,15 @@ class BinanceFeed:
                 yield update
                 last_seq, synced = update.last_seq, True
 
-            async for update in stream:
-                if update.last_seq <= last_seq:
+            async for event in stream:
+                if isinstance(event, Trade):
+                    yield event
                     continue
-                self._require_contiguous(update, last_seq, synced)
-                yield update
-                last_seq, synced = update.last_seq, True
+                if event.last_seq <= last_seq:
+                    continue
+                self._require_contiguous(event, last_seq, synced)
+                yield event
+                last_seq, synced = event.last_seq, True
         finally:
             # Closes the generator's `async with`, and with it the socket.
             await stream.aclose()
@@ -221,9 +246,9 @@ class BinanceFeed:
     async def _seed(
         self,
         client: httpx.AsyncClient,
-        stream: AsyncIterator[BookUpdate],
-    ) -> tuple[BookSnapshot, list[BookUpdate]]:
-        """Buffer updates while the snapshot is fetched concurrently.
+        stream: AsyncIterator[BookUpdate | Trade],
+    ) -> tuple[BookSnapshot, list[BookUpdate | Trade]]:
+        """Buffer events while the snapshot is fetched concurrently.
 
         The two must overlap. Fetching first loses every update issued during
         the request; buffering first without concurrency means nobody reads the
@@ -231,10 +256,11 @@ class BinanceFeed:
         through the buffered range and `updates_after_snapshot` joins them.
 
         Returns:
-            ``(snapshot, buffered)`` -- the snapshot, and every update that
+            ``(snapshot, buffered)`` -- the snapshot, and every event that
             arrived while it was being fetched, oldest first and unfiltered.
-            Never empty. Buffered updates older than the snapshot are still
-            present; the caller discards them.
+            Never empty, and mixed: trades and updates in arrival order.
+            Buffered updates older than the snapshot are still present; the
+            caller discards them.
         """
         # The socket does not exist until the generator is first advanced, so
         # this line is what connects. Creating the fetch task before it races

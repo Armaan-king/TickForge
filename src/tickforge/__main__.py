@@ -15,7 +15,7 @@ import sys
 
 from tickforge.adapters.binance_feed import BinanceFeed
 from tickforge.book import ApplyResult, OrderBook
-from tickforge.events import BookSnapshot
+from tickforge.events import BookSnapshot, Trade
 
 
 async def watch(symbol: str, duration_s: float) -> None:
@@ -23,6 +23,7 @@ async def watch(symbol: str, duration_s: float) -> None:
     feed = BinanceFeed(symbol)
     events = 0
     snapshots = 0
+    trades = 0
 
     try:
         async with asyncio.timeout(duration_s):
@@ -35,6 +36,16 @@ async def watch(symbol: str, duration_s: float) -> None:
                     print(
                         f"snapshot seq={event.last_seq} "
                         f"{len(event.bids)}x{len(event.asks)} levels -> {state.name}"
+                    )
+                    continue
+
+                # Must come before the book branch: a trade reaching
+                # `book.apply` would be an AttributeError on `last_seq`.
+                if isinstance(event, Trade):
+                    trades += 1
+                    print(
+                        f"trade    {event.aggressor.value:<4} "
+                        f"{event.quantity} @ {event.price}"
                     )
                     continue
 
@@ -52,7 +63,10 @@ async def watch(symbol: str, duration_s: float) -> None:
     except TimeoutError:
         pass
 
-    print(f"\n{events} events, {snapshots} snapshot(s) --> more than one means a resync")
+    print(
+        f"\n{events} events, {trades} trade(s), {snapshots} snapshot(s) "
+        f"--> more than one snapshot means a resync"
+    )
 
 
 def main() -> None:

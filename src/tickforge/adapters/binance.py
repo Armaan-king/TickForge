@@ -13,6 +13,21 @@ Wire format of a @depth frame::
      "b": [["77381.36", "1.29"], ...],   bid levels, [price, qty] as strings
      "a": [["77381.37", "3.16"], ...]}   ask levels
 
+Wire format of a @trade frame::
+
+    {"e": "trade",              event type
+     "E": 1788376136014,        event time -- when the SERVER sent this
+     "s": "BTCUSDT",            symbol
+     "t": 4183726,              trade id
+     "p": "77381.36",           price
+     "q": "0.00214",            quantity
+     "T": 1788376136011,        trade time -- when the MATCH happened
+     "m": false}                was the buyer the market maker?
+
+A combined subscription wraps either of those in an envelope::
+
+    {"stream": "btcusdt@depth", "data": { ... }}
+
 A quantity of ``"0"`` means the level is removed. Prices and quantities arrive
 as decimal strings so the exact value survives; they are converted straight to
 Decimal, never via float.
@@ -22,7 +37,7 @@ import json
 import time
 from decimal import Decimal
 
-from tickforge.events import BookSnapshot, BookUpdate, PriceLevel
+from tickforge.events import BookSnapshot, BookUpdate, PriceLevel, Side, Trade
 
 EXCHANGE = "binance"
 SNAPSHOT_URL = "https://api.binance.com/api/v3/depth"
@@ -35,6 +50,40 @@ def _levels(raw_levels: list[list[str]]) -> tuple[PriceLevel, ...]:
     them here would leave phantom liquidity that never clears.
     """
     return tuple((Decimal(price), Decimal(quantity)) for price, quantity in raw_levels)
+
+
+def _depth_update(message: dict, received_ns: int) -> BookUpdate:
+    """Build a `BookUpdate` from an already-decoded ``depthUpdate`` body."""
+    return BookUpdate(
+        exchange=EXCHANGE,
+        symbol=message["s"],
+        timestamp_ns=message["E"] * 1_000_000,
+        received_ns=received_ns,
+        first_seq=message["U"],
+        last_seq=message["u"],
+        bids=_levels(message["b"]),
+        asks=_levels(message["a"]),
+    )
+
+
+def _trade(message: dict, received_ns: int) -> Trade:
+    """Build a `Trade` from an already-decoded ``trade`` body."""
+    return Trade(
+        exchange=EXCHANGE,
+        symbol=message["s"],
+        # "T", the match time -- not "E", the moment the server sent the frame.
+        # The gap between them is server-side queuing and carries no market
+        # information. See `Trade.timestamp_ns`.
+        timestamp_ns=message["T"] * 1_000_000,
+        received_ns=received_ns,
+        price=Decimal(message["p"]),
+        quantity=Decimal(message["q"]),
+        trade_id=message["t"],
+        # "m" asks whether the buyer was the market maker. True means the
+        # buyer's order was already resting, so the seller crossed the spread.
+        # The field name stops here; downstream only ever sees a `Side`.
+        aggressor=Side.SELL if message["m"] else Side.BUY,
+    )
 
 
 def parse_depth_update(raw: str | bytes, received_ns: int | None = None) -> BookUpdate:
@@ -63,16 +112,71 @@ def parse_depth_update(raw: str | bytes, received_ns: int | None = None) -> Book
     if event_type != "depthUpdate":
         raise ValueError(f"expected a depthUpdate frame, got {event_type!r}")
 
-    return BookUpdate(
-        exchange=EXCHANGE,
-        symbol=message["s"],
-        timestamp_ns=message["E"] * 1_000_000,
-        received_ns=received_ns,
-        first_seq=message["U"],
-        last_seq=message["u"],
-        bids=_levels(message["b"]),
-        asks=_levels(message["a"]),
-    )
+    return _depth_update(message, received_ns)
+
+
+def parse_trade(raw: str | bytes, received_ns: int | None = None) -> Trade:
+    """Translate one Binance ``trade`` frame into a `Trade`.
+
+    Args:
+        raw: A single WebSocket text frame from the ``@trade`` stream.
+        received_ns: Local receive time in nanoseconds. Defaults to now.
+
+    Returns:
+        The normalized trade, with Binance's maker flag already resolved into
+        an aggressor `Side`.
+
+    Raises:
+        ValueError: The frame is not a ``trade``.
+        KeyError: A required field is absent.
+    """
+    if received_ns is None:
+        received_ns = time.time_ns()
+
+    message = json.loads(raw)
+
+    event_type = message.get("e")
+    if event_type != "trade":
+        raise ValueError(f"expected a trade frame, got {event_type!r}")
+
+    return _trade(message, received_ns)
+
+
+def parse_stream_frame(
+    raw: str | bytes, received_ns: int | None = None
+) -> BookUpdate | Trade:
+    """Translate one frame from a *combined* subscription.
+
+    A combined stream multiplexes several subscriptions onto one socket, so
+    the venue decides the interleaving of trades and depth updates rather than
+    the client inventing an order by merging two connections.
+
+    Args:
+        raw: A frame from ``/stream?streams=...``, wrapped in the envelope.
+        received_ns: Local receive time in nanoseconds. Defaults to now.
+
+    Returns:
+        Whichever event the frame carried.
+
+    Raises:
+        ValueError: The envelope is malformed, or carries an event type this
+            adapter does not handle.
+        KeyError: A required field is absent.
+    """
+    if received_ns is None:
+        received_ns = time.time_ns()
+
+    envelope = json.loads(raw)
+    if "data" not in envelope:
+        raise ValueError(f"not a combined-stream frame: {envelope}")
+
+    message = envelope["data"]
+    event_type = message.get("e")
+    if event_type == "depthUpdate":
+        return _depth_update(message, received_ns)
+    if event_type == "trade":
+        return _trade(message, received_ns)
+    raise ValueError(f"unsupported event type {event_type!r}")
 
 
 def parse_snapshot(

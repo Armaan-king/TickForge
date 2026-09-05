@@ -5,6 +5,66 @@ months. Record the rejected options too — that's what stops the re-argument.
 
 ---
 
+## 2026-09-05 — `Trade` carries a derived aggressor and the match time
+
+**Decision:** `Trade.aggressor` is a `Side` computed in the adapter, not
+Binance's `m` flag stored verbatim. `Trade.timestamp_ns` is the venue's match
+time (`T`), not its emission time (`E`). `Side` is a `StrEnum`.
+
+**Why:** `m` answers "was the buyer the market maker?" — a Binance sentence,
+and a *negation* of the thing analytics actually want. Storing it would put a
+venue's field semantics downstream of the adapter, and every consumer would
+re-derive the inversion, each with its own chance of getting it backwards.
+`T` over `E` because the gap between them is server-side queuing: real, but
+not market information, and Phase 4 correlates trades against book state by
+this timestamp. `StrEnum` because `Side` gets written to Parquet in Phase 5 —
+a member *is* its string, so it round-trips through storage with no conversion
+layer, unlike the `Enum`/`auto()` pattern used for the book's internal states.
+
+**Rejected — store `is_buyer_maker: bool`:** lossless and venue-shaped. Pushes
+a boolean whose meaning is inverted relative to the question being asked into
+every downstream consumer.
+
+**Rejected — `E` as the timestamp:** consistent with `BookUpdate`, and wrong
+for a different reason: a depth frame has no moment of occurrence separate
+from its emission, and a trade does.
+
+**Consequence:** a venue that reports the aggressor directly needs no
+inversion, and one that reports neither cannot produce a `Trade` at all —
+`aggressor` is not optional. The sign convention is now asserted in
+`test_binance_adapter.py` in both directions, because a flipped aggressor
+produces plausible order-flow imbalance rather than an obvious failure.
+
+---
+
+## 2026-09-05 — Depth and trades share one combined socket
+
+**Decision:** `stream_events` subscribes to `@depth` and `@trade` through
+Binance's combined-stream endpoint, yielding both types from one connection.
+
+**Why:** the interleaving of trades and book updates is market information.
+Phase 4 reads trade flow against book state, so the order has to come from the
+venue rather than from whichever `asyncio` task the loop happened to schedule
+first. One socket also means one reconnect, one resync, and one place where
+the sequencing state lives.
+
+**Rejected — two connections merged with an `asyncio.Queue`:** invents an
+ordering the exchange never stated, and makes it depend on scheduling — so
+replay of a recorded session would not reproduce the live interleaving.
+
+**Rejected — trades on a separate feed object entirely:** the book and trade
+flow would resync independently, and analytics could see trades from a window
+the book never covered.
+
+**Consequence:** the seeding buffer is now mixed. Trades captured during
+seeding are emitted as a block after the snapshot rather than in arrival
+order, which is unobservable downstream — a trade has no sequence number to
+be ordered against — but is a real, if bounded, reordering. Adding a third
+subscription means touching the dispatch in `parse_stream_frame` and nothing
+else.
+
+---
+
 ## 2026-09-02 — `apply()` returns a result; reads fail closed
 
 **Decision:** `OrderBook.apply()` returns an `ApplyResult` rather than raising

@@ -7,9 +7,24 @@ docs/knowledge/architecture.md.
 
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 
 PriceLevel = tuple[Decimal, Decimal]
 """(price, quantity). A quantity of 0 means the level is removed."""
+
+
+class Side(StrEnum):
+    """The side that crossed the spread to make a trade happen.
+
+    A `StrEnum` rather than the `Enum`/`auto()` pattern in `book.py`: those are
+    internal states that never leave the process, while this one gets written
+    to Parquet in Phase 5. A `StrEnum` member *is* its string, so it lands in a
+    string column with no conversion and survives the round trip unchanged;
+    `auto()` would store an integer whose meaning lives only in this file.
+    """
+
+    BUY = "buy"
+    SELL = "sell"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +87,55 @@ class BookSnapshot:
     bids: tuple[PriceLevel, ...]
     asks: tuple[PriceLevel, ...]
 
+@dataclass(frozen=True, slots=True)
+class Trade:
+    """A single execution.
 
-MarketEvent = BookUpdate | BookSnapshot
-"""Anything the pipeline carries. Widen as event types are added."""
+    Not book state. A trade carries no sequence range and no contiguity
+    requirement, because a missed trade cannot corrupt anything the way a
+    missed book update can -- it is simply lost. Nothing downstream needs to
+    halt over one.
+
+    Attributes:
+        exchange: Origin venue. Downstream may record it but must not branch
+            on it.
+        symbol: Venue-neutral instrument identifier.
+        timestamp_ns: When the match happened, nanoseconds since epoch -- not
+            when the venue emitted the frame. Binance sends both (`T` and `E`)
+            and the gap between them is server-side queuing, which carries no
+            market information. Analytics line trades up against book state by
+            this value, so it has to be the match time. `BookUpdate` uses the
+            emission time only because a depth frame has no separate moment of
+            occurrence; a trade does.
+        received_ns: Local receive time, nanoseconds.
+        price: Execution price.
+        quantity: Base-asset amount filled.
+        trade_id: Venue trade identifier. Present for deduplication after a
+            reconnect, not for ordering -- nothing requires it to be gap-free,
+            and no component may halt on a jump in it.
+        aggressor: The side that crossed the spread. Derived, never copied:
+            Binance reports `m`, "was the buyer the market maker?", and that
+            field must not survive the adapter -- see architecture.md. `m`
+            true means the buyer's order was already resting on the book, so
+            the *seller* crossed, and the trade is `Side.SELL`. Getting this
+            backwards is invisible -- both directions produce plausible
+            order-flow imbalance in Phase 4, one of them sign-flipped.
+    """
+
+    exchange: str
+    symbol: str
+    timestamp_ns: int
+    received_ns: int
+    price: Decimal
+    quantity: Decimal
+    trade_id: int
+    aggressor: Side
+
+
+MarketEvent = BookUpdate | BookSnapshot | Trade
+"""Anything the pipeline carries. Widen as event types are added.
+
+Widening this is an API change, not an addition: every `isinstance` dispatch
+downstream gains a case it does not handle, and the ones written as
+if-snapshot-else-update silently start treating the new type as an update.
+"""
