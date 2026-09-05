@@ -157,6 +157,8 @@ class FlowFeatures:
         self._returns: deque[tuple[int, Decimal]] = deque()
         self._prev_touch: L1 | None = None
         self._prev_mid: Decimal | None = None
+        self._tracking = False
+        self._holed_until: int | None = None
 
     def observe(self, event: MarketEvent, book: OrderBook) -> None:
         """Record one event. Call after the book has been updated with it.
@@ -191,14 +193,34 @@ class FlowFeatures:
         looking entirely normal -- the silent-corruption failure this project
         exists to avoid. Trades survive: each one is self-contained, and the
         ones already recorded really did happen.
+
+        Clearing is not enough on its own. An emptied window reads as zero,
+        and zero means "no net flow" -- a calm, confident number, produced for
+        a full window immediately after the one event that says the market was
+        probably doing something. So the window is also marked incomplete
+        until it has refilled entirely from after the gap, and the two
+        continuity-dependent features report None until then.
+
+        A *first* snapshot is not a resync: nothing was missed, observation
+        simply starts here. `_tracking` tells the two apart, because the feed
+        deliberately does not signal a resync -- applying the new snapshot is
+        the whole of the recovery.
         """
+        if self._tracking:
+            self._holed_until = self._now + self._window_ns
         self._ofi.clear()
         self._returns.clear()
         self._prev_touch = _touch(book)
         self._prev_mid = midprice(book)
 
+    @property
+    def _holed(self) -> bool:
+        """True while the window still spans a resynchronisation."""
+        return self._holed_until is not None and self._now < self._holed_until
+
     def _observe_book(self, book: OrderBook) -> None:
         """Turn a book update into an order-flow and a return contribution."""
+        self._tracking = True
         touch = _touch(book)
         mid = midprice(book)
 
@@ -255,14 +277,17 @@ class FlowFeatures:
         return (bought - sold) / (bought + sold)
 
     @property
-    def order_flow_imbalance(self) -> Decimal:
+    def order_flow_imbalance(self) -> Decimal | None:
         """Net size added at the bid minus net size added at the ask.
 
         Returns:
             Signed size, not a ratio -- positive is net buying pressure. Zero
-            on an empty window, which here means "no net flow", not "unknown":
-            no observed updates is genuinely no observed flow.
+            on an empty window means "no net flow", not "unknown": no observed
+            updates is genuinely no observed flow. None is the unknown case,
+            and means the window still spans a resynchronisation.
         """
+        if self._holed:
+            return None
         return sum((e for _, e in self._ofi), Decimal(0))
 
     @property
@@ -274,9 +299,10 @@ class FlowFeatures:
         want an annual figure supply their own factor.
 
         Returns:
-            None until at least one price change has been seen.
+            None until at least one price change has been seen, and again
+            while the window spans a resynchronisation.
         """
-        if not self._returns:
+        if self._holed or not self._returns:
             return None
         return sum((r for _, r in self._returns), Decimal(0)).sqrt()
 

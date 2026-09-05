@@ -86,7 +86,7 @@ async def watch(symbol: str, duration_s: float) -> None:
                     f"micro {microprice(book) - mid:+.4f} | "
                     f"L1 {imbalance(book, 1):+.2f} "
                     f"L5 {imbalance(book, 5):+.2f} | "
-                    f"ofi {flow.order_flow_imbalance:+8.3f} "
+                    f"ofi {show(flow.order_flow_imbalance, '+8.3f')} "
                     f"tImb {show(flow.trade_imbalance, '+.2f')} "
                     f"vwap {show(None if vwap is None else vwap - mid, '+8.2f')} "
                     # Scaled to basis points: realised vol over 60s on a liquid

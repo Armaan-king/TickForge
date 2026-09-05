@@ -233,16 +233,51 @@ def test_the_clock_never_runs_backwards() -> None:
 # --- resynchronisation ------------------------------------------------------
 
 
-def test_a_snapshot_discards_flow_measured_before_it() -> None:
-    """A snapshot means updates went missing. Order flow summed across that
-    hole understates the period while looking entirely normal -- which is the
-    silent corruption the whole project is arranged to avoid."""
+def test_a_snapshot_makes_flow_unknown_not_zero() -> None:
+    """The distinction the whole resync branch turns on.
+
+    Clearing the window leaves zero, and zero reads as "no net flow" -- a calm
+    number produced for a full window right after the one event saying the
+    market was probably busy. Unknown has to look unknown.
+    """
     p = seeded()
     p.feed(update(2, T0 + SECOND, bids=(("100", "9"),)))
     assert p.flow.order_flow_imbalance == Decimal("4")
 
     p.feed(snapshot(at=T0 + 2 * SECOND))
+    assert p.flow.order_flow_imbalance is None
+    assert p.flow.realised_volatility is None
+
+
+def test_flow_becomes_known_again_once_the_window_clears_the_gap() -> None:
+    """Once no part of the window predates the resync, the sum is honest."""
+    p = seeded()
+    p.feed(update(2, T0 + SECOND, bids=(("100", "9"),)))
+    p.feed(snapshot(at=T0 + 2 * SECOND))
+    assert p.flow.order_flow_imbalance is None
+
+    # Sequence 2, not 3: the fresh snapshot reset the book to sequence 1, so
+    # anything further ahead is a gap and would invalidate it.
+    p.feed(update(2, T0 + 63 * SECOND, bids=(("100", "8"),)))
+    assert p.flow.order_flow_imbalance == Decimal("3")  # 8 - 5, post-gap only
+
+
+def test_a_first_snapshot_is_not_a_resync() -> None:
+    """Nothing was missed -- observation starts here. Reporting unknown for a
+    whole window at every startup would make the feature useless."""
+    p = Pipeline()
+    p.feed(snapshot())
     assert p.flow.order_flow_imbalance == Decimal("0")
+
+
+def test_a_resync_does_not_make_trade_features_unknown() -> None:
+    """Trades are self-contained, so a gap in book updates says nothing about
+    them. Only the two continuity-dependent features go dark."""
+    p = seeded()
+    p.feed(trade("100", "1", Side.BUY, T0 + SECOND))
+    p.feed(snapshot(at=T0 + 2 * SECOND))
+    assert p.flow.vwap == Decimal("100")
+    assert p.flow.trade_imbalance == Decimal("1")
 
 
 def test_a_snapshot_keeps_the_trades() -> None:
@@ -255,9 +290,14 @@ def test_a_snapshot_keeps_the_trades() -> None:
 
 
 def test_flow_resumes_from_the_new_snapshot() -> None:
-    """The touch is re-seeded from the fresh book, so the next update produces
-    a contribution rather than being silently skipped."""
+    """The touch is re-seeded from the fresh book, so the first update after a
+    resync produces a contribution rather than being silently skipped.
+
+    Reads through the private deque because the property reports None until
+    the window clears the gap -- this checks the measurement happened, which
+    is a separate question from whether it is safe to report yet.
+    """
     p = seeded()
     p.feed(snapshot(at=T0 + SECOND, bids=(("100", "5"),)))
     p.feed(update(2, T0 + 2 * SECOND, bids=(("100", "8"),)))
-    assert p.flow.order_flow_imbalance == Decimal("3")
+    assert [contribution for _, contribution in p.flow._ofi] == [Decimal("3")]
