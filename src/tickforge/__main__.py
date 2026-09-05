@@ -15,21 +15,28 @@ whether any of it survives a real resync.
 import asyncio
 import sys
 
+from decimal import Decimal
+
 from tickforge.adapters.binance_feed import BinanceFeed
-from tickforge.analytics import imbalance, market_depth, microprice, midprice
+from tickforge.analytics import FlowFeatures, imbalance, microprice, midprice
 from tickforge.book import ApplyResult, OrderBook
-from tickforge.events import BookSnapshot, Side, Trade
+from tickforge.events import BookSnapshot, Trade
+
+WINDOW_NS = 60 * 1_000_000_000
+
+
+def show(value: Decimal | None, spec: str) -> str:
+    """Format a feature, or a dash where it has nothing to report yet."""
+    return "--".rjust(len(format(Decimal(0), spec))) if value is None else format(value, spec)
 
 
 async def watch(symbol: str, duration_s: float) -> None:
     book = OrderBook("binance", symbol.upper())
+    flow = FlowFeatures(WINDOW_NS)
     feed = BinanceFeed(symbol)
     events = 0
     snapshots = 0
     trades = 0
-    # Reset on every book line, so each row shows the flow that arrived during
-    # that window rather than a running total.
-    bought = sold = 0
 
     try:
         async with asyncio.timeout(duration_s):
@@ -39,6 +46,10 @@ async def watch(symbol: str, duration_s: float) -> None:
                 if isinstance(event, BookSnapshot):
                     snapshots += 1
                     state = book.load_snapshot(event)
+                    # Only observe a book the load actually validated -- a
+                    # crossed snapshot leaves it INVALID and its reads raise.
+                    if book.is_valid:
+                        flow.observe(event, book)
                     print(
                         f"snapshot seq={event.last_seq} "
                         f"{len(event.bids)}x{len(event.asks)} levels -> {state.name}"
@@ -49,12 +60,9 @@ async def watch(symbol: str, duration_s: float) -> None:
                 # `book.apply` would be an AttributeError on `last_seq`.
                 if isinstance(event, Trade):
                     trades += 1
-                    # Counted, not printed: BTCUSDT runs ~25 trades a second
-                    # and one line each buries the feature rows entirely.
-                    if event.aggressor is Side.BUY:
-                        bought += 1
-                    else:
-                        sold += 1
+                    # Accumulated, not printed: BTCUSDT runs ~25 trades a
+                    # second and one line each buries the feature rows.
+                    flow.observe(event, book)
                     continue
 
                 # The point of the smoke test: anything but APPLIED means the
@@ -64,22 +72,27 @@ async def watch(symbol: str, duration_s: float) -> None:
                     print(f"!! {result.name} at seq {event.first_seq}-{event.last_seq}")
                     continue
 
+                flow.observe(event, book)
+
                 mid = midprice(book)
                 if mid is None:
                     continue
-                micro = microprice(book)
-                bid_depth, ask_depth = market_depth(book, 5)
+                vwap = flow.vwap
+                rvol = flow.realised_volatility
                 print(
-                    f"mid {mid:.2f}  "
-                    # The offset, not the absolute: microprice tracks mid to
-                    # within a tick, so the interesting number is the lean.
-                    f"micro {micro - mid:+.4f}  "
-                    f"L1 {imbalance(book, 1):+.3f}  "
-                    f"L5 {imbalance(book, 5):+.3f}  "
-                    f"depth {bid_depth:.2f}/{ask_depth:.2f}  "
-                    f"trades {bought}b/{sold}s"
+                    f"mid {mid:.2f} "
+                    # Offsets, not absolutes: microprice tracks mid to within a
+                    # tick and VWAP to within a few, so the lean is the signal.
+                    f"micro {microprice(book) - mid:+.4f} | "
+                    f"L1 {imbalance(book, 1):+.2f} "
+                    f"L5 {imbalance(book, 5):+.2f} | "
+                    f"ofi {flow.order_flow_imbalance:+8.3f} "
+                    f"tImb {show(flow.trade_imbalance, '+.2f')} "
+                    f"vwap {show(None if vwap is None else vwap - mid, '+8.2f')} "
+                    # Scaled to basis points: realised vol over 60s on a liquid
+                    # pair is ~1e-5, which prints as 0.00 in fixed notation.
+                    f"rv {show(None if rvol is None else rvol * 10000, '.2f')}bp"
                 )
-                bought = sold = 0
     except TimeoutError:
         pass
 
