@@ -50,9 +50,14 @@ def trade(at=T0, quantity="0.5", aggressor=Side.SELL) -> Trade:
     return Trade("binance", "BTCUSDT", at, at + 1, PRICE, Decimal(quantity), 42, aggressor)
 
 
+def files(root: Path, stream: str, day: str = DAY) -> list[Path]:
+    """Every session's file for one stream, oldest session first."""
+    return sorted((root / "binance" / "BTCUSDT" / day).glob(f"{stream}-*.parquet"))
+
+
 def read(root: Path, stream: str, day: str = DAY) -> list[dict]:
-    path = root / "binance" / "BTCUSDT" / day / f"{stream}.parquet"
-    return pq.read_table(path).to_pylist()
+    """One stream's rows across every session in a partition."""
+    return pq.read_table(files(root, stream, day)).to_pylist()
 
 
 # --- fidelity ---------------------------------------------------------------
@@ -108,8 +113,50 @@ def test_an_unused_stream_leaves_no_file(tmp_path) -> None:
     with EventStore(tmp_path, "binance", "BTCUSDT") as store:
         store.write(update())
 
-    directory = tmp_path / "binance" / "BTCUSDT" / DAY
-    assert not (directory / "trades.parquet").exists()
+    assert files(tmp_path, "trades") == []
+    assert files(tmp_path, "book_updates") != []
+
+
+def test_capture_seq_counts_every_stream_together(tmp_path) -> None:
+    """Replay's only ordering key, so it has to span the three files.
+
+    Neither timestamp column can order the merge: time.time_ns() resolves to
+    ~0.6ms here so events collide, and the exchange clock leads this machine
+    enough that an event's timestamp can precede its own arrival.
+    """
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write(snapshot())
+        store.write(trade())
+        store.write(update())
+        store.write(trade())
+
+    assert read(tmp_path, "snapshots")[0]["capture_seq"] == 0
+    assert [row["capture_seq"] for row in read(tmp_path, "trades")] == [1, 3]
+    assert read(tmp_path, "book_updates")[0]["capture_seq"] == 2
+
+
+def test_a_rejected_event_consumes_no_capture_seq(tmp_path) -> None:
+    """The counter must stay dense, or replay cannot tell a rejected write
+    from a lost one."""
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        store.write(update())
+        with pytest.raises(ValueError):
+            store.write(BookUpdate("binance", "ETHUSDT", T0, T0, 1, 1, LEVELS, ()))
+        store.write(update())
+
+    assert [row["capture_seq"] for row in read(tmp_path, "book_updates")] == [0, 1]
+
+
+def test_two_sessions_both_survive(tmp_path) -> None:
+    """A Parquet writer opens for writing, not appending, so a fixed filename
+    meant the second capture of the day silently replaced the first."""
+    with EventStore(tmp_path, "binance", "BTCUSDT", session=1) as store:
+        store.write(update(first_seq=1, last_seq=1))
+    with EventStore(tmp_path, "binance", "BTCUSDT", session=2) as store:
+        store.write(update(first_seq=2, last_seq=2))
+
+    assert len(files(tmp_path, "book_updates")) == 2
+    assert sorted(row["first_seq"] for row in read(tmp_path, "book_updates")) == [1, 2]
 
 
 def test_sequence_range_is_preserved(tmp_path) -> None:

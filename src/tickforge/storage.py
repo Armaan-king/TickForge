@@ -10,6 +10,7 @@ docs/superpowers/specs/2026-09-05-parquet-storage-design.md
 """
 
 import datetime as dt
+import time
 from collections.abc import AsyncIterator
 from dataclasses import fields
 from decimal import Decimal
@@ -61,9 +62,18 @@ _IDENTITY = [("exchange", pa.string()), ("symbol", pa.string())]
 # that can only lose information.
 _TIMES = [("timestamp_ns", pa.int64()), ("received_ns", pa.int64())]
 
+# The order events were emitted in, and the ONLY thing replay may order by.
+# Neither timestamp can be: `time.time_ns()` resolves to ~0.6ms on Windows so
+# roughly 3% of events share a received_ns, and the exchange clock leads this
+# machine by ~187ms so an event's timestamp can precede its own arrival. The
+# two columns produce genuinely different orderings, and both have ties.
+# Distinct from first_seq/last_seq, which are the venue's numbers.
+_ORDER = [("capture_seq", pa.int64())]
+
 TRADE_SCHEMA = pa.schema(
     _IDENTITY
     + _TIMES
+    + _ORDER
     + [
         ("trade_id", pa.int64()),
         ("price", PRICE),
@@ -78,6 +88,7 @@ TRADE_SCHEMA = pa.schema(
 UPDATE_SCHEMA = pa.schema(
     _IDENTITY
     + _TIMES
+    + _ORDER
     + [
         ("first_seq", pa.int64()),
         ("last_seq", pa.int64()),
@@ -89,6 +100,7 @@ UPDATE_SCHEMA = pa.schema(
 SNAPSHOT_SCHEMA = pa.schema(
     _IDENTITY
     + _TIMES
+    + _ORDER
     + [
         # No range: a snapshot is the whole book as of one sequence number, not
         # a change spanning several. Sharing the update schema would mean
@@ -187,6 +199,12 @@ class EventStore:
     columnar: writing one row at a time would make every row its own row group,
     each with full footer overhead.
 
+    Each store instance is one *session*, and its files carry a session stamp:
+    ``trades-1788682769.parquet``. Parquet writers open for writing, not
+    appending, so a fixed filename meant a second capture on the same day
+    silently replaced the first. Readers treat a directory as one dataset, so
+    nothing downstream notices the difference.
+
     Use as a context manager. An unclosed Parquet file has no footer and cannot
     be read at all, so closing is a correctness requirement rather than
     tidiness.
@@ -199,6 +217,7 @@ class EventStore:
         symbol: str,
         batch_rows: int = 5_000,
         batch_ns: int = 30 * NS_PER_SECOND,
+        session: int | None = None,
     ) -> None:
         """
         Args:
@@ -209,16 +228,23 @@ class EventStore:
                 indefinitely on a quiet symbol; an interval alone gives wildly
                 uneven row groups on a busy one. Both bound the loss window
                 regardless of feed rate.
+            session: Stamp distinguishing this capture's files from an earlier
+                one in the same partition. Defaults to now. Wall clock, but it
+                only names files -- it never reaches a stored value.
         """
         self._root = Path(root)
         self._exchange = exchange
         self._symbol = symbol
         self._batch_rows = batch_rows
         self._batch_ns = batch_ns
+        self._session = time.time_ns() if session is None else session
         self._date: str | None = None
         self._writers: dict[str, pq.ParquetWriter] = {}
         self._buffers: dict[str, list[dict]] = {name: [] for name in STREAMS}
         self._last_flush_ns: int | None = None
+        # Dense counter over every raw row this session writes, across all
+        # three streams. Replay's only ordering key -- see _ORDER.
+        self._capture_seq = 0
 
     def __enter__(self) -> "EventStore":
         return self
@@ -229,6 +255,10 @@ class EventStore:
     def write(self, event: MarketEvent) -> None:
         """Buffer one raw event, rolling the partition and flushing as needed."""
         stream, row = self._row(event)
+        # Stamped here rather than in _row so it counts writes, not row
+        # constructions -- a rejected event must not consume a number.
+        row["capture_seq"] = self._capture_seq
+        self._capture_seq += 1
         self._append(stream, row, event.timestamp_ns)
 
     def write_features(self, features: FeatureSnapshot) -> None:
@@ -357,7 +387,7 @@ class EventStore:
             directory = self._root / self._exchange / self._symbol / str(self._date)
             directory.mkdir(parents=True, exist_ok=True)
             self._writers[name] = pq.ParquetWriter(
-                directory / f"{name}.parquet", STREAMS[name]
+                directory / f"{name}-{self._session}.parquet", STREAMS[name]
             )
         return self._writers[name]
 
