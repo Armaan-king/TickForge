@@ -122,6 +122,41 @@ def test_sequence_range_is_preserved(tmp_path) -> None:
     assert (row["first_seq"], row["last_seq"]) == (101, 110)
 
 
+def test_an_event_for_another_instrument_is_refused(tmp_path) -> None:
+    """The row's identity columns come from the store, not the event.
+
+    So a mismatched event would be silently relabelled and filed under the
+    wrong symbol -- permanently, and looking entirely correct on read. Loud is
+    the only acceptable behaviour.
+    """
+    ether = BookUpdate("binance", "ETHUSDT", T0, T0, 1, 1, LEVELS, ())
+
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        with pytest.raises(ValueError, match="ETHUSDT"):
+            store.write(ether)
+
+
+def test_an_event_from_another_venue_is_refused(tmp_path) -> None:
+    okx = BookUpdate("okx", "BTCUSDT", T0, T0, 1, 1, LEVELS, ())
+
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        with pytest.raises(ValueError, match="okx"):
+            store.write(okx)
+
+
+def test_an_unknown_event_type_is_refused(tmp_path) -> None:
+    """A new event type must not land in book_updates by fallthrough and die
+    on a missing field, which would say nothing about the real cause."""
+
+    class MarketStatus:
+        exchange, symbol = "binance", "BTCUSDT"
+        timestamp_ns = received_ns = T0
+
+    with EventStore(tmp_path, "binance", "BTCUSDT") as store:
+        with pytest.raises(ValueError, match="MarketStatus"):
+            store.write(MarketStatus())
+
+
 # --- partitioning -----------------------------------------------------------
 
 

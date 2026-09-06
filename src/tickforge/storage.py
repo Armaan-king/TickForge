@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tickforge.analytics import FeatureSnapshot
-from tickforge.events import BookSnapshot, MarketEvent, PriceLevel, Trade
+from tickforge.events import BookSnapshot, BookUpdate, MarketEvent, PriceLevel, Trade
 
 NS_PER_SECOND = 1_000_000_000
 
@@ -112,8 +112,12 @@ def _date_of(timestamp_ns: int) -> str:
     return dt.datetime.fromtimestamp(seconds, tz=dt.UTC).strftime("%Y-%m-%d")
 
 
-def _levels(levels: tuple[PriceLevel, ...]) -> list[dict[str, Decimal]]:
-    """Turn ``(price, quantity)`` pairs into the structs LEVELS expects."""
+def _level_structs(levels: tuple[PriceLevel, ...]) -> list[dict[str, Decimal]]:
+    """Turn ``(price, quantity)`` pairs into the structs LEVELS expects.
+
+    Named for its direction, because `binance._levels` does the opposite --
+    wire strings into memory, where this takes memory onto disk.
+    """
     return [{"price": price, "quantity": quantity} for price, quantity in levels]
 
 
@@ -269,7 +273,20 @@ class EventStore:
         """Which stream this event belongs to, and its row.
 
         Raw events are written verbatim -- no rounding anywhere on this path.
+
+        Raises:
+            ValueError: The event is for a different instrument, or is a type
+                this store has no schema for.
         """
+        if (event.exchange, event.symbol) != (self._exchange, self._symbol):
+            # The row's identity columns come from the store, so a mismatched
+            # event would be silently relabelled and filed under the wrong
+            # symbol -- permanently, and looking entirely correct.
+            raise ValueError(
+                f"{event.exchange}:{event.symbol} event sent to a "
+                f"{self._exchange}:{self._symbol} store"
+            )
+
         common = {
             "exchange": self._exchange,
             "symbol": self._symbol,
@@ -289,16 +306,21 @@ class EventStore:
             return "snapshots", {
                 **common,
                 "last_seq": event.last_seq,
-                "bids": _levels(event.bids),
-                "asks": _levels(event.asks),
+                "bids": _level_structs(event.bids),
+                "asks": _level_structs(event.asks),
             }
-        return "book_updates", {
-            **common,
-            "first_seq": event.first_seq,
-            "last_seq": event.last_seq,
-            "bids": _levels(event.bids),
-            "asks": _levels(event.asks),
-        }
+        if isinstance(event, BookUpdate):
+            return "book_updates", {
+                **common,
+                "first_seq": event.first_seq,
+                "last_seq": event.last_seq,
+                "bids": _level_structs(event.bids),
+                "asks": _level_structs(event.asks),
+            }
+        # Explicit rather than a fallthrough: a new event type would otherwise
+        # land in book_updates and fail on a missing field, which says nothing
+        # about what actually went wrong.
+        raise ValueError(f"no schema for {type(event).__name__}")
 
     def _feature_row(self, features: FeatureSnapshot) -> dict:
         """Round every derived value to the stored scale.
