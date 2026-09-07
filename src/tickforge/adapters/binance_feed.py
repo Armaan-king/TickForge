@@ -21,6 +21,20 @@ STREAM_URL = "wss://stream.binance.com:9443/stream"
 RESYNC_DELAY_S = 1.0
 """Pause before rebuilding. Connection health only -- never affects output."""
 
+STALE_AFTER_S = 30.0
+"""Silence this long means the feed is dead, not the market quiet.
+
+`websockets` already pings and drops a connection whose TCP peer stops
+answering. This catches the other case: a socket that stays open and
+acknowledges pings while delivering no market data. Rarer, and invisible
+without a timeout -- the book would simply keep serving its last state as
+though it were current.
+
+Generous on purpose. Binance pushes depth every 1000ms on a liquid pair, but
+an illiquid one can genuinely go quiet, and a false resync costs a real gap in
+the data. Connection health only; it never reaches a computed value.
+"""
+
 class ResyncRequired(RuntimeError):
     """The book cannot be maintained from here; a fresh snapshot is needed."""
 
@@ -29,6 +43,9 @@ class SnapshotTooOldError(ResyncRequired):
 
 class SequenceGapError(ResyncRequired):
     """Updates were missed mid-stream."""
+
+class StaleFeedError(ResyncRequired):
+    """The socket is open but has delivered nothing for too long."""
 
 def updates_after_snapshot(snapshot:BookSnapshot,buffered:list[BookUpdate])->list[BookUpdate]:
     """Discard the buffered updates the snapshot already reflects.
@@ -112,6 +129,35 @@ async def stream_events(symbol:str)->AsyncIterator[BookUpdate | Trade]:
             received_ns=time.time_ns()
             yield parse_stream_frame(message,received_ns=received_ns)
 
+async def require_fresh(
+    stream: AsyncIterator[BookUpdate | Trade], timeout_s: float = STALE_AFTER_S
+) -> AsyncIterator[BookUpdate | Trade]:
+    """Pass events through, raising if the stream goes silent for too long.
+
+    Wraps every ``__anext__`` in a timeout rather than checking freshness after
+    an event arrives -- a loop that only wakes on events cannot notice their
+    absence, which is exactly the failure being detected.
+
+    Yields:
+        Whatever `stream` yielded, unchanged.
+
+    Raises:
+        StaleFeedError: Nothing arrived within `timeout_s`.
+    """
+    try:
+        while True:
+            try:
+                yield await asyncio.wait_for(anext(stream), timeout_s)
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                raise StaleFeedError(f"no data for {timeout_s}s") from None
+    finally:
+        # Closing this generator does not close the one it wraps -- see
+        # pitfalls.md. The socket lives in there.
+        await stream.aclose()
+
+
 class BinanceFeed:
     """Maintains a synchronized Binance depth feed for one symbol.
 
@@ -167,7 +213,10 @@ class BinanceFeed:
             ResyncRequired: Synchronisation was lost and cannot be recovered
                 without a new snapshot.
         """
-        stream = stream_events(self.symbol)
+        # Wrapped once here, so seeding and the live loop are both covered --
+        # a socket that connects and then delivers nothing would otherwise
+        # block `_seed` forever with no error.
+        stream = require_fresh(stream_events(self.symbol))
         try:
             snapshot, buffered = await self._seed(client, stream)
             # Trades have no sequence relationship to the snapshot, so they

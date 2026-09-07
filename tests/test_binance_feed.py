@@ -18,9 +18,12 @@ from websockets.exceptions import WebSocketException
 from tickforge.adapters import binance_feed
 from tickforge.adapters.binance_feed import (
     BinanceFeed,
+    ResyncRequired,
     SequenceGapError,
     SnapshotTooOldError,
+    StaleFeedError,
     fetch_snapshot,
+    require_fresh,
     updates_after_snapshot,
 )
 from tickforge.events import BookSnapshot, BookUpdate, Side, Trade
@@ -548,6 +551,80 @@ async def test_sync_once_closes_the_stream_when_it_fails(monkeypatch) -> None:
     assert stream.closed == 1
 
 
+# --- staleness --------------------------------------------------------------
+
+
+@async_test
+async def test_a_silent_stream_is_stale_not_quiet(monkeypatch) -> None:
+    """The failure a loop that only wakes on events cannot see.
+
+    A socket that stays open and answers pings while delivering no data would
+    otherwise leave the book serving its last state forever, as though it were
+    current. `websockets` catches a dead TCP peer; nothing catches this.
+    """
+
+    async def silent():
+        await asyncio.Event().wait()
+        yield  # pragma: no cover -- never reached
+
+    with pytest.raises(StaleFeedError):
+        async for _ in require_fresh(silent(), timeout_s=0.01):
+            pass
+
+
+@async_test
+async def test_a_live_stream_is_passed_through_untouched() -> None:
+    """The guard must be invisible while data is flowing."""
+    script = [update(101, 110), update(111, 120)]
+
+    seen = [event async for event in require_fresh(FakeStream(script)("BTCUSDT"))]
+
+    assert seen == script
+
+
+@async_test
+async def test_the_timeout_resets_on_every_event() -> None:
+    """A slow feed is not a dead one. The deadline is per event, not per
+    session, or any capture lasting longer than the timeout would fail."""
+
+    async def slow():
+        for seq in range(4):
+            await asyncio.sleep(0.05)
+            yield update(seq, seq)
+
+    # 200ms of session against a 150ms timeout: the total exceeds it while no
+    # single gap does. Margins are wide because Windows resolves sleeps to
+    # ~15ms, so a tighter test would fail under suite contention rather than
+    # on a real defect.
+    seen = [event async for event in require_fresh(slow(), timeout_s=0.15)]
+
+    assert len(seen) == 4
+
+
+@async_test
+async def test_the_wrapped_stream_is_closed() -> None:
+    """Closing this generator does not close the one it wraps, and the socket
+    lives in there. Same trap as `run` and `_sync_once`."""
+    stream = FakeStream([update(101, 110)])
+
+    async for _ in require_fresh(stream("BTCUSDT"), timeout_s=1):
+        break
+
+    # The break suspends the wrapper; aclose on it must reach the inner one.
+    assert stream.closed == 0
+    gen = require_fresh(stream("BTCUSDT"), timeout_s=1)
+    await anext(gen)
+    await gen.aclose()
+    assert stream.closed == 1
+
+
+@async_test
+async def test_a_stale_feed_triggers_a_resync(monkeypatch) -> None:
+    """StaleFeedError is a ResyncRequired, so `run` recovers from it the same
+    way it recovers from a gap -- a fresh snapshot, no special case."""
+    assert issubclass(StaleFeedError, ResyncRequired)
+
+
 # --- run --------------------------------------------------------------------
 
 
@@ -595,14 +672,15 @@ async def test_run_waits_before_reconnecting_on_a_clean_close(monkeypatch) -> No
     async def spy_sleep(seconds: float) -> None:
         delays.append(seconds)
 
-    # Only the three attributes `binance_feed` actually uses, so the fakes above
-    # keep the real `asyncio.sleep` and their event-loop hops still work.
+    # Only the attributes `binance_feed` actually uses, so the fakes above keep
+    # the real `asyncio.sleep` and their event-loop hops still work.
     monkeypatch.setattr(
         binance_feed,
         "asyncio",
         SimpleNamespace(
             sleep=spy_sleep,
             create_task=asyncio.create_task,
+            wait_for=asyncio.wait_for,
             CancelledError=asyncio.CancelledError,
         ),
     )
