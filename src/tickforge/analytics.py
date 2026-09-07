@@ -83,8 +83,13 @@ def market_depth(book: OrderBook, depth: int) -> tuple[Decimal,Decimal]:
     return (bid_total,ask_total)
 
 def imbalance(book: OrderBook, depth: int) -> Decimal | None:
-    bids=book.top_bids(depth)
-    asks=book.top_asks(depth)
+    """The normalised form of `market_depth`: which side is heavier.
+
+    Returns:
+        [-1, 1]; positive is bid-heavy, zero balanced. None only when both
+        sides are empty, where the ratio is undefined -- a one-sided book
+        saturates at +/-1 instead.
+    """
     bid_total, ask_total = market_depth(book, depth)
     if bid_total+ask_total==0:
         return None

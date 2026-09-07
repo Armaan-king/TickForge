@@ -18,7 +18,15 @@ dependencies = [
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.pytest.ini_options]
+# `benchmarks/` is excluded on purpose: it takes seconds per run, and a suite
+# you hesitate to run is a suite that stops catching things.
+#   uv run pytest              the 158 correctness tests
+#   uv run pytest benchmarks/  the timings
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-benchmark>=5.3.0",
 ]

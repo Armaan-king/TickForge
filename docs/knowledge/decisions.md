@@ -5,6 +5,61 @@ months. Record the rejected options too — that's what stops the re-argument.
 
 ---
 
+## 2026-09-07 — `Decimal` stays; the 20× claim was wrong
+
+**Decision:** keep `decimal.Decimal` for prices and quantities. The Phase 9
+benchmark that was supposed to justify switching to scaled `int` instead
+closed the question the other way.
+
+**Measured** (`python -m tickforge bench`, call overhead subtracted):
+
+```
+Decimal multiply   27.0 ns
+int multiply       24.4 ns
+ratio               1.1x
+```
+
+The 2026-09-02 entry below estimated 20×. It is wrong by a factor of eighteen.
+
+**Why:** in Python the alternative is not a machine-word integer. A price at
+8dp scaled to an int is ~7.7e12, a quantity ~1.3e8, and their product ~1e21 —
+past 64 bits, so CPython falls back to multi-digit arithmetic. `Decimal`'s C
+backend (libmpdec) is competitive with that. **The scaled-int trick buys in
+C++ what it does not buy in Python**, because Python has no machine-word
+integer type to win with.
+
+**Consequence:** the largest deferred performance question in the project is
+closed, and the exactness guarantee costs almost nothing. Do not re-propose
+scaled ints without a measurement showing something different — and note that
+a benchmark comparing `Decimal` against *small* ints would mislead, since
+those are not the numbers this system holds.
+
+---
+
+## 2026-09-07 — Feature computation is the dominant cost, and stays that way
+
+**Decision:** leave `feature_snapshot` at ~374 µs per call. Measured, named,
+not optimised.
+
+**Why:** it reaches `top_bids`/`top_asks`/`best_bid` roughly ten times per
+row, each a full pass over a 1000-level side. Computing `top_bids(10)` once
+and slicing it for depths 1 and 5 would cut it to roughly 100 µs.
+
+But features are computed once per *book update*, and Binance pushes depth
+every 1000 ms. That is 374 µs per second — 0.04% of one core. The optimisation
+would be real and would buy nothing.
+
+**Rejected — do it anyway because it is easy:** it needs level-taking variants
+of five pure functions, or inlined arithmetic that duplicates the formulas.
+The second is how microprice's crossed weighting gets "fixed" into a bug.
+
+**Consequence:** subscribing to `@depth@100ms` multiplies this by ten and it is
+still 0.4% of a core, so the ceiling is far off. Revisit if a venue pushes
+depth faster than that, or if feature rows are ever computed per *trade*
+rather than per update — at 33 trades/sec that would be 1.2% and climbing.
+
+---
+
 ## 2026-09-05 — `Trade` carries a derived aggressor and the match time
 
 **Decision:** `Trade.aggressor` is a `Side` computed in the adapter, not

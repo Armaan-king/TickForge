@@ -166,9 +166,37 @@ async def rerun(symbol: str, date: str, speed: float, data_root: str) -> None:
     await consume(symbol, source)
 
 
+def measure(symbol: str, date: str, data_root: str) -> None:
+    """Profile the pipeline over a recorded capture.
+
+    Reads the capture rather than the live feed so the measurement is
+    reproducible: two runs process identical work, which is the difference
+    between a benchmark and a stopwatch.
+    """
+    from tickforge import bench
+    from tickforge.replay import read_partition
+
+    events = read_partition(data_root, "binance", symbol.upper(), date)
+    bench.report(events)
+    bench.storage_throughput(events, _scratch())
+    bench._decimal_cost()
+
+
+def _scratch() -> str:
+    """A throwaway directory for the storage benchmark's output."""
+    import tempfile
+
+    return tempfile.mkdtemp(prefix="tickforge-bench-")
+
+
 def main() -> None:
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == "replay":
+        if len(sys.argv) > 1 and sys.argv[1] == "bench":
+            symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
+            date = sys.argv[3] if len(sys.argv) > 3 else _today()
+            root = sys.argv[4] if len(sys.argv) > 4 else "data"
+            measure(symbol, date, root)
+        elif len(sys.argv) > 1 and sys.argv[1] == "replay":
             symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
             date = sys.argv[3] if len(sys.argv) > 3 else _today()
             speed = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
