@@ -97,3 +97,15 @@ actually happened.
   held, or a bare `except` in a reconnect loop.
 - **Avoid by:** holding references to created tasks, and making failures loud.
   Connection health must be observable, not inferred from data still flowing.
+
+## HTTP readers can accidentally introduce threads
+
+- **Symptom:** a book response mixes levels from different updates, or a
+  collection changes during iteration, despite ingestion using one event loop.
+- **Cause:** synchronous FastAPI endpoint handlers run in a thread pool. They
+  can read the book while the feed task mutates it; a synchronous `observe`
+  method alone does not make that safe.
+- **Avoid by:** keeping the API handlers async and doing state observation and
+  response construction without awaits. This keeps readers and the writer on
+  one loop with no interleaving inside an event or response. Moving either
+  operation to a worker thread would require revisiting synchronization.

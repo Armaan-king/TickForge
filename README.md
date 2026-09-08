@@ -25,6 +25,21 @@ uv sync
 uv run pytest
 ```
 
+Start the HTTP API (tracks BTCUSDT using the live Binance feed):
+
+```text
+uv run uvicorn tickforge.api:app
+```
+
+Open http://127.0.0.1:8000/docs for interactive endpoint documentation.
+The API exposes `/markets/BTCUSDT/book`, `/markets/BTCUSDT/features`,
+`/markets/BTCUSDT/trades`, and `/system/health`. Prices, quantities, and
+decimal features are JSON strings to preserve exact values.
+
+Health returns HTTP 200 with a `status` of `ok` or `degraded`; consumers
+must inspect the body. Before the first snapshot, book requests return 503.
+Features return 404 until a valid update arrives, including after a resync.
+
 ## Docs
 
 - [Goal](docs/Goal.md) — the full 10-phase spec and success criteria.
