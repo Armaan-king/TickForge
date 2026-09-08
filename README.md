@@ -103,6 +103,95 @@ The API exposes `/markets/{symbol}/book`, `/features`, `/trades`, and
 `/system/health`. Decimal values are JSON strings, since a JSON number becomes
 a float in every client and discards the exactness the pipeline preserves.
 
+## Testing
+
+```bash
+uv run pytest                      # all 193, ~10s, no network
+uv run pytest -v                   # every test name; they read as a spec
+uv run pytest tests/test_order_book.py    # one file
+uv run pytest -k microprice        # by name fragment, across files
+uv run pytest -x --tb=short        # stop at the first failure
+```
+
+**No test touches the network.** The feed is driven by scripted async
+generators, and the HTTP layer runs a real `httpx.AsyncClient` over
+`MockTransport`, so URL building, parameter encoding and `raise_for_status`
+all execute for real against a fake socket. Async tests use a small
+`functools.wraps` decorator rather than a plugin, which keeps the dependency
+list honest.
+
+| file | tests | covers |
+| --- | --- | --- |
+| `test_binance_feed.py` | 31 | Resync procedure, sequence gaps, staleness, socket lifecycle |
+| `test_api.py` | 26 | Four endpoints, fail-closed responses, feed lifecycle |
+| `test_storage.py` | 26 | Parquet round trip, partition rollover, batching, `capture_seq` |
+| `test_order_book.py` | 23 | Snapshot loading, level updates and deletes, crossed detection |
+| `test_binance_adapter.py` | 22 | Wire parsing, aggressor inversion, match-vs-emission time |
+| `test_flow_features.py` | 22 | Rolling windows, event-time clock, resync handling |
+| `test_analytics.py` | 19 | Spread, midprice, microprice, imbalance, depth |
+| `test_replay.py` | 12 | Determinism, ordering, pacing |
+| `test_properties.py` | 9 | Hypothesis invariants (each generates hundreds of cases) |
+| `test_docs.py` | 3 | Markdown links resolve |
+
+### Property-based tests
+
+```bash
+uv run pytest tests/test_properties.py -v
+uv run pytest tests/test_properties.py --hypothesis-seed=random    # new inputs
+uv run pytest tests/test_properties.py --hypothesis-show-statistics
+```
+
+Nine tests, but each generates hundreds of inputs. `BookLifecycle` drives
+`OrderBook` as a state machine: random sequences of snapshots and updates, with
+every invariant re-checked after each step. When one fails, Hypothesis shrinks
+the input to the smallest sequence that still breaks it.
+
+To stress it harder than the suite does, raise the settings on the generated
+`TestCase`:
+
+```python
+from hypothesis import settings
+from tests.test_properties import BookLifecycle
+
+BookLifecycle.TestCase.settings = settings(max_examples=2000, stateful_step_count=80)
+BookLifecycle.TestCase().runTest()
+```
+
+### What the tests are trying to catch
+
+The failure mode this project is built against is not a crash. It is a number
+that is wrong and looks right, so the tests are written to fail on plausible
+output rather than only on exceptions.
+
+Microprice shows both halves of that. The property test asserts only that it
+lands inside the spread, which is true of the correct formula *and* of the
+version with the weights paired the obvious wrong way. So the direction is
+pinned by example instead, with deliberately unequal sizes on the two sides:
+`test_microprice_leans_toward_the_lighter_side` fails against the wrong
+weighting, where a balanced fixture could not tell them apart.
+
+The same shape recurs. Order-flow imbalance returning `0` after a resync is
+indistinguishable from a genuinely balanced market, so a test asserts `None`.
+A one-sided book, by contrast, has a real imbalance of exactly `±1`, and a
+separate test pins that it does *not* go unknown.
+
+`test_replaying_twice_gives_identical_output` is the headline: it captures a
+session, replays it twice, and asserts the two feature streams are equal. Two
+full CLI replays were also checked to produce matching SHA-256 output.
+
+### Benchmarks
+
+Excluded from the default suite via `testpaths`, because a suite you hesitate
+to run stops catching things.
+
+```bash
+uv run pytest benchmarks/ --benchmark-columns=median,ops --benchmark-sort=mean
+uv run python -m tickforge bench BTCUSDT <date> data    # whole pipeline
+```
+
+Nothing asserts a threshold. A benchmark that fails on a busy laptop teaches
+nothing; these exist to be read and re-run after a change.
+
 ## Components
 
 Each stage below owns one job and hands the next a type, not a method call.
