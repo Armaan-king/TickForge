@@ -66,12 +66,10 @@ def microprice(book: OrderBook) -> Decimal | None:
         return None
     bid_px, bid_qty=bids[0]
     ask_px, ask_qty=asks[0]
-    # CROSSED on purpose: each price is weighted by the OTHER side's size.
-    # A big wall of offers is hard to buy through and easy to sell into, so
-    # price runs away from the heavy side -- and the heavy side's own quantity
-    # is what has to be the weight on the opposite price.
-    # Pairing each price with its own quantity looks like the fix, and is the
-    # bug: still lands between bid and ask, just leaning the wrong way.
+    # CROSSED on purpose: each price is weighted by the OTHER side's size,
+    # because price runs away from the heavy side. Pairing each price with its
+    # own quantity looks like the fix and is the bug -- the result still lands
+    # between bid and ask, just leaning the wrong way.
     mcp=(bid_px*ask_qty+ask_px*bid_qty)/(bid_qty+ask_qty)
     return mcp
 
@@ -139,26 +137,14 @@ class FlowFeatures:
     def __init__(self, window_ns: int) -> None:
         self._window_ns = window_ns
         self._now = 0
-        # deque, not list. The window is strictly FIFO -- newest in at the
-        # right, oldest out at the left -- and `list.pop(0)` is O(n) because a
-        # list is one contiguous array, so removing the head relocates
-        # everything behind it. `deque.popleft()` is O(1). BTCUSDT runs ~33
-        # trades a second, so a 60s window holds ~2000 entries and evicts
-        # roughly once per arrival: 2000 element shifts per event with a list,
-        # one pointer move with a deque.
+        # deque, not list: the window is strictly FIFO and `list.pop(0)` is
+        # O(n). A 60s window on BTCUSDT holds ~2000 entries and evicts about
+        # once per arrival. Entries are kept rather than folded into a running
+        # sum because subtracting an expired one means knowing what it was.
         #
-        # The items are stored rather than folded into a running sum because
-        # subtracting an expired entry means knowing what it was. The deque is
-        # that record.
+        # ponytail: reads are O(n) over the window. If a profile shows that
+        # dominating, keep running totals and subtract on eviction.
         self._trades: deque[Trade] = deque()
-        # (timestamp, contribution) rather than raw state: both of these are
-        # per-update quantities, so evicting the oldest entry is the whole of
-        # rolling the window forward.
-        #
-        # ponytail: reads are O(n) over the window. If a Phase 9 profile shows
-        # that dominating, keep running totals and subtract on eviction --
-        # O(1) reads, at the cost of the totals and the deque being able to
-        # disagree.
         self._ofi: deque[tuple[int, Decimal]] = deque()
         self._returns: deque[tuple[int, Decimal]] = deque()
         self._prev_touch: L1 | None = None
@@ -177,9 +163,9 @@ class FlowFeatures:
                 Reading it here rather than tracking L1 independently avoids a
                 second implementation of something `book.py` already gets right.
         """
-        # Never let the clock run backwards. Trades are stamped at match time
-        # and depth frames at emission time, so the two interleave slightly
-        # out of order; a receding cutoff would widen the window at random.
+        # Trades are stamped at match time and depth frames at emission time,
+        # so they interleave slightly out of order. A receding cutoff would
+        # widen the window at random.
         self._now = max(self._now, event.timestamp_ns)
 
         if isinstance(event, Trade):

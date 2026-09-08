@@ -78,9 +78,7 @@ async def consume(
                 if isinstance(event, BookSnapshot):
                     snapshots += 1
                     state = book.load_snapshot(event)
-                    # Only observe a book the load actually validated -- a
-                    # crossed snapshot leaves it INVALID and its reads raise.
-                    if book.is_valid:
+                    if book.is_valid:  # a crossed snapshot loads INVALID
                         flow.observe(event, book)
                     print(
                         f"snapshot seq={event.last_seq} "
@@ -88,26 +86,22 @@ async def consume(
                     )
                     continue
 
-                # Must come before the book branch: a trade reaching
-                # `book.apply` would be an AttributeError on `last_seq`.
+                # Before the book branch: a trade reaching `book.apply` would
+                # be an AttributeError on `last_seq`.
                 if isinstance(event, Trade):
                     trades += 1
-                    # Accumulated, not printed: BTCUSDT runs ~25 trades a
-                    # second and one line each buries the feature rows.
                     flow.observe(event, book)
                     continue
 
-                # The point of the smoke test: anything but APPLIED means the
-                # feed and the book disagree about what a valid sequence is.
                 result = book.apply(event)
                 if result is not ApplyResult.APPLIED:
+                    # Anything but APPLIED means the feed and the book
+                    # disagree about what a valid sequence is.
                     print(f"!! {result.name} at seq {event.first_seq}-{event.last_seq}")
                     continue
 
                 flow.observe(event, book)
 
-                # Computed once, then both printed and stored -- so what lands
-                # in features.parquet is exactly what you watched go past.
                 f = feature_snapshot(book, flow, event.timestamp_ns)
                 if store is not None:
                     store.write_features(f)
@@ -115,14 +109,12 @@ async def consume(
                 if f.midprice is None:
                     continue
                 mid = f.midprice
-                # Scaled to basis points: realised vol over 60s on a liquid
-                # pair is ~1e-5, which prints as 0.00 in fixed notation.
+                # Offsets and basis points: microprice tracks mid to within a
+                # tick and realised vol runs ~1e-5, so absolutes print as noise.
                 rv_bp = None if f.realised_volatility is None else f.realised_volatility * 10000
                 vwap_offset = None if f.vwap is None else f.vwap - mid
                 print(
                     f"mid {mid:.2f} "
-                    # Offsets, not absolutes: microprice tracks mid to within a
-                    # tick and VWAP to within a few, so the lean is the signal.
                     f"micro {f.microprice - mid:+.4f} | "
                     f"L1 {f.imbalance_1:+.2f} "
                     f"L5 {f.imbalance_5:+.2f} | "

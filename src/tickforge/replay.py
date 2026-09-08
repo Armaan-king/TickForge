@@ -104,9 +104,8 @@ def read_partition(
         raise FileNotFoundError(f"no capture at {directory}")
 
     events: list[MarketEvent] = []
-    # ponytail: reads a whole partition into memory -- fine for a day of one
-    # symbol, and Phase 9 is where a streaming heap merge across the three
-    # files would earn its keep.
+    # ponytail: reads a whole partition into memory. A streaming heap merge
+    # across the three files is the upgrade if a capture outgrows RAM.
     for session in sorted(sessions):
         rows: list[tuple[int, MarketEvent]] = []
         for stream, path in sessions[session].items():
@@ -139,8 +138,8 @@ async def replay(
     previous: int | None = None
     for event in events:
         if speed and previous is not None:
-            # Clamped: time.time_ns() can step backwards, and a negative wait
-            # would raise rather than simply not sleeping.
+            # Clamped: time.time_ns() can step backwards, and asyncio.sleep
+            # raises on a negative delay rather than returning immediately.
             gap = max(0, event.received_ns - previous) / NS_PER_SECOND / speed
             if gap:
                 await asyncio.sleep(gap)

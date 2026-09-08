@@ -190,15 +190,12 @@ class BinanceFeed:
                 except (ResyncRequired, WebSocketException, httpx.HTTPError, OSError):
                     pass
                 finally:
-                    # Abandoning the iteration -- because a resync is due, or
-                    # because the consumer stopped reading -- does not close
-                    # the generator, and its `finally` is what releases the
-                    # socket. Left to the garbage collector it may never run.
+                    # Abandoning an async generator does not close it, and its
+                    # `finally` is what releases the socket. See pitfalls.md.
                     await session.aclose()
-                # Reached on a clean close too: `websockets` ends the iteration
-                # rather than raising when the server hangs up normally, so an
-                # except-only wait would spin the reconnect loop at full speed.
-                # Retrying instantly through an outage gets the IP banned.
+                # Outside the except: `websockets` ends the iteration rather
+                # than raising on a clean server hangup, and an except-only
+                # wait would spin the reconnect loop into an IP ban.
                 await asyncio.sleep(RESYNC_DELAY_S)
 
     async def _sync_once(self, client: httpx.AsyncClient) -> AsyncIterator[MarketEvent]:
@@ -213,13 +210,12 @@ class BinanceFeed:
             ResyncRequired: Synchronisation was lost and cannot be recovered
                 without a new snapshot.
         """
-        # Wrapped once here, so seeding and the live loop are both covered --
-        # a socket that connects and then delivers nothing would otherwise
-        # block `_seed` forever with no error.
+        # Wrapped here so seeding is covered too: a socket that connects and
+        # then delivers nothing would otherwise block `_seed` forever.
         stream = require_fresh(stream_events(self.symbol))
         try:
             snapshot, buffered = await self._seed(client, stream)
-            # Trades have no sequence relationship to the snapshot, so they
+            # Trades carry no sequence relationship to the snapshot, so they
             # are neither filtered against it nor checked for contiguity.
             trades = [e for e in buffered if isinstance(e, Trade)]
             joined = updates_after_snapshot(
@@ -228,20 +224,16 @@ class BinanceFeed:
 
             yield snapshot
 
-            # Emitted as a block rather than in arrival order. Nothing
-            # downstream can observe the difference -- a trade is not ordered
-            # against a sequence number -- and it only affects the one-second
-            # seeding window. Interleaving them properly would mean tracking
-            # each update's position in `buffered` for no gain.
+            # A block rather than in arrival order, which is unobservable
+            # downstream and only spans the seeding window. See decisions.md.
             for trade in trades:
                 yield trade
 
             last_seq = snapshot.last_seq
             synced = False
 
-            # Buffered and live updates get the same check. A gap that opened
-            # during the buffering window is exactly as fatal as one that opens
-            # later, and only the live loop used to be checked at all.
+            # Buffered updates get the same check as live ones: a gap that
+            # opened during the buffering window is exactly as fatal.
             for update in joined:
                 if update.last_seq <= last_seq:
                     continue
@@ -259,7 +251,6 @@ class BinanceFeed:
                 yield event
                 last_seq, synced = event.last_seq, True
         finally:
-            # Closes the generator's `async with`, and with it the socket.
             await stream.aclose()
 
     def _require_contiguous(
@@ -312,9 +303,8 @@ class BinanceFeed:
             caller discards them.
         """
         # The socket does not exist until the generator is first advanced, so
-        # this line is what connects. Creating the fetch task before it races
-        # the handshake, and on a slow one the snapshot comes back newer than
-        # anything buffered -- which fails the join on every attempt, forever.
+        # this line is what connects. Creating the fetch task first races the
+        # handshake, and a slow one fails the join on every attempt, forever.
         buffered = [await anext(stream)]
         snapshot_task = asyncio.create_task(fetch_snapshot(client, self.symbol))
         try:

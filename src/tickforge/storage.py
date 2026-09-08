@@ -51,23 +51,19 @@ flattening to one row per level would multiply rows by roughly 500 and force
 every reader to reconstruct the boundaries before it could replay anything.
 """
 
-# `exchange` and `symbol` repeat the directory path on every row. Parquet
-# dictionary-encodes a constant string column down to one dictionary entry plus
-# RLE indices, so the cost is negligible -- and it keeps a file readable on its
-# own if it is ever moved out of its partition.
+# Repeats the directory path on every row, but Parquet dictionary-encodes a
+# constant string column to near nothing, and it keeps a file self-describing
+# if it is ever moved out of its partition.
 _IDENTITY = [("exchange", pa.string()), ("symbol", pa.string())]
 
-# int64 nanoseconds rather than pa.timestamp('ns'): the events already carry
-# integers, and the timestamp type adds timezone semantics plus a conversion
-# that can only lose information.
+# int64 rather than pa.timestamp('ns'): the events already carry integers, and
+# the timestamp type adds timezone semantics and a lossy conversion.
 _TIMES = [("timestamp_ns", pa.int64()), ("received_ns", pa.int64())]
 
-# The order events were emitted in, and the ONLY thing replay may order by.
-# Neither timestamp can be: `time.time_ns()` resolves to ~0.6ms on Windows so
-# roughly 3% of events share a received_ns, and the exchange clock leads this
-# machine by ~187ms so an event's timestamp can precede its own arrival. The
-# two columns produce genuinely different orderings, and both have ties.
-# Distinct from first_seq/last_seq, which are the venue's numbers.
+# The ONLY thing replay may order by. Neither timestamp can be: time.time_ns()
+# resolves to ~0.6ms here so ~3% of events share a received_ns, and the
+# exchange clock leads this machine by ~187ms so an event's timestamp can
+# precede its own arrival. Distinct from the venue's first_seq/last_seq.
 _ORDER = [("capture_seq", pa.int64())]
 
 TRADE_SCHEMA = pa.schema(
@@ -78,9 +74,8 @@ TRADE_SCHEMA = pa.schema(
         ("trade_id", pa.int64()),
         ("price", PRICE),
         ("quantity", PRICE),
-        # The aggressor Side, as its string value. This is what StrEnum was
-        # chosen for -- the member *is* the string, so it lands here with no
-        # conversion step and survives the round trip unchanged.
+        # A StrEnum member *is* its string, so Side needs no conversion here
+        # or on the way back. That is what the type was chosen for.
         ("aggressor", pa.string()),
     ]
 )
@@ -102,10 +97,9 @@ SNAPSHOT_SCHEMA = pa.schema(
     + _TIMES
     + _ORDER
     + [
-        # No range: a snapshot is the whole book as of one sequence number, not
-        # a change spanning several. Sharing the update schema would mean
-        # nullable range columns and a row whose meaning depends on which
-        # columns happen to be null.
+        # No range: a snapshot is the whole book as of one sequence number.
+        # Sharing the update schema would mean nullable range columns and a
+        # row whose meaning depends on which of them happen to be null.
         ("last_seq", pa.int64()),
         ("bids", LEVELS),
         ("asks", LEVELS),
@@ -242,8 +236,7 @@ class EventStore:
         self._writers: dict[str, pq.ParquetWriter] = {}
         self._buffers: dict[str, list[dict]] = {name: [] for name in STREAMS}
         self._last_flush_ns: int | None = None
-        # Dense counter over every raw row this session writes, across all
-        # three streams. Replay's only ordering key -- see _ORDER.
+        # Dense across all three raw streams. Replay's ordering key, see _ORDER.
         self._capture_seq = 0
 
     def __enter__(self) -> "EventStore":
@@ -255,8 +248,7 @@ class EventStore:
     def write(self, event: MarketEvent) -> None:
         """Buffer one raw event, rolling the partition and flushing as needed."""
         stream, row = self._row(event)
-        # Stamped here rather than in _row so it counts writes, not row
-        # constructions -- a rejected event must not consume a number.
+        # After _row, so a rejected event consumes no number.
         row["capture_seq"] = self._capture_seq
         self._capture_seq += 1
         self._append(stream, row, event.timestamp_ns)
@@ -309,9 +301,8 @@ class EventStore:
                 this store has no schema for.
         """
         if (event.exchange, event.symbol) != (self._exchange, self._symbol):
-            # The row's identity columns come from the store, so a mismatched
-            # event would be silently relabelled and filed under the wrong
-            # symbol -- permanently, and looking entirely correct.
+            # Identity columns come from the store, so a mismatched event
+            # would be silently relabelled and filed under the wrong symbol.
             raise ValueError(
                 f"{event.exchange}:{event.symbol} event sent to a "
                 f"{self._exchange}:{self._symbol} store"
@@ -329,7 +320,6 @@ class EventStore:
                 "trade_id": event.trade_id,
                 "price": event.price,
                 "quantity": event.quantity,
-                # A StrEnum member *is* its string, so it needs no conversion.
                 "aggressor": event.aggressor,
             }
         if isinstance(event, BookSnapshot):
@@ -347,9 +337,8 @@ class EventStore:
                 "bids": _level_structs(event.bids),
                 "asks": _level_structs(event.asks),
             }
-        # Explicit rather than a fallthrough: a new event type would otherwise
-        # land in book_updates and fail on a missing field, which says nothing
-        # about what actually went wrong.
+        # Explicit rather than a fallthrough, which would land a new event
+        # type in book_updates and fail on a missing field instead.
         raise ValueError(f"no schema for {type(event).__name__}")
 
     def _feature_row(self, features: FeatureSnapshot) -> dict:

@@ -71,17 +71,15 @@ def _trade(message: dict, received_ns: int) -> Trade:
     return Trade(
         exchange=EXCHANGE,
         symbol=message["s"],
-        # "T", the match time -- not "E", the moment the server sent the frame.
-        # The gap between them is server-side queuing and carries no market
-        # information. See `Trade.timestamp_ns`.
+        # "T", the match time, not "E", when the server sent the frame. The
+        # gap between them is queuing and carries no market information.
         timestamp_ns=message["T"] * 1_000_000,
         received_ns=received_ns,
         price=Decimal(message["p"]),
         quantity=Decimal(message["q"]),
         trade_id=message["t"],
-        # "m" asks whether the buyer was the market maker. True means the
-        # buyer's order was already resting, so the seller crossed the spread.
-        # The field name stops here; downstream only ever sees a `Side`.
+        # "m" is "was the buyer the maker?", so true means the buyer was
+        # already resting and the SELLER crossed. The inversion stops here.
         aggressor=Side.SELL if message["m"] else Side.BUY,
     )
 
