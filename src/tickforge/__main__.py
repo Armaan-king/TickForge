@@ -28,6 +28,7 @@ point: a separate replay path would silently become a different system.
 import asyncio
 import datetime as dt
 import sys
+import time
 from collections.abc import AsyncIterator
 from decimal import Decimal
 
@@ -46,11 +47,17 @@ def show(value: Decimal | None, spec: str) -> str:
     return "--".rjust(len(format(Decimal(0), spec))) if value is None else format(value, spec)
 
 
+def stamp() -> str:
+    """UTC wall clock, for log lines only. Never reaches a computed value."""
+    return dt.datetime.now(tz=dt.UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
 async def consume(
     symbol: str,
     source: AsyncIterator[MarketEvent],
     store: EventStore | None = None,
     duration_s: float | None = None,
+    heartbeat_s: float | None = None,
 ) -> None:
     """Drive the book, the analytics and optionally storage from an event source.
 
@@ -63,12 +70,21 @@ async def consume(
         duration_s: Wall-clock stop for a live run. None replays to the end of
             the recording. The only wall clock here, and it decides when to
             stop reading, never what any event means.
+        heartbeat_s: Print a timestamped status line at most this often instead
+            of one line per book update, for runs long enough that per-update
+            output is unreadable. Resyncs and rejected updates still print
+            immediately, since those are the reason to read the log at all.
     """
     book = OrderBook("binance", symbol.upper())
     flow = FlowFeatures(WINDOW_NS)
     events = 0
     snapshots = 0
     trades = 0
+    rejected = 0
+    last_beat = time.monotonic()
+
+    if heartbeat_s:
+        print(f"{stamp()}  start {symbol.upper()}  heartbeat {heartbeat_s:.0f}s", flush=True)
 
     try:
         async with asyncio.timeout(duration_s):
@@ -80,9 +96,15 @@ async def consume(
                     state = book.load_snapshot(event)
                     if book.is_valid:  # a crossed snapshot loads INVALID
                         flow.observe(event, book)
+                    prefix = f"{stamp()}  " if heartbeat_s else ""
+                    # A snapshot after the first one means a resync happened,
+                    # which is the single most interesting event in a long run.
+                    note = " RESYNC" if snapshots > 1 else ""
                     print(
-                        f"snapshot seq={event.last_seq} "
-                        f"{len(event.bids)}x{len(event.asks)} levels -> {state.name}"
+                        f"{prefix}snapshot seq={event.last_seq} "
+                        f"{len(event.bids)}x{len(event.asks)} levels -> "
+                        f"{state.name}{note}",
+                        flush=True,
                     )
                     continue
 
@@ -97,7 +119,13 @@ async def consume(
                 if result is not ApplyResult.APPLIED:
                     # Anything but APPLIED means the feed and the book
                     # disagree about what a valid sequence is.
-                    print(f"!! {result.name} at seq {event.first_seq}-{event.last_seq}")
+                    rejected += 1
+                    prefix = f"{stamp()}  " if heartbeat_s else ""
+                    print(
+                        f"{prefix}!! {result.name} at seq "
+                        f"{event.first_seq}-{event.last_seq}",
+                        flush=True,
+                    )
                     continue
 
                 flow.observe(event, book)
@@ -113,6 +141,23 @@ async def consume(
                 # tick and realised vol runs ~1e-5, so absolutes print as noise.
                 rv_bp = None if f.realised_volatility is None else f.realised_volatility * 10000
                 vwap_offset = None if f.vwap is None else f.vwap - mid
+
+                if heartbeat_s:
+                    now = time.monotonic()
+                    if now - last_beat < heartbeat_s:
+                        continue
+                    last_beat = now
+                    print(
+                        f"{stamp()}  mid {mid:.2f}  "
+                        f"L1 {f.imbalance_1:+.2f}  "
+                        f"ofi {show(f.order_flow_imbalance, '+8.3f')}  "
+                        f"rv {show(rv_bp, '.2f')}bp  |  "
+                        f"{events:,} events  {trades:,} trades  "
+                        f"{snapshots} snapshot(s)  {rejected} rejected",
+                        flush=True,
+                    )
+                    continue
+
                 print(
                     f"mid {mid:.2f} "
                     f"micro {f.microprice - mid:+.4f} | "
@@ -126,13 +171,20 @@ async def consume(
     except TimeoutError:
         pass
 
+    prefix = f"{stamp()}  " if heartbeat_s else "\n"
     print(
-        f"\n{events} events, {trades} trade(s), {snapshots} snapshot(s) "
-        f"--> more than one snapshot means a resync"
+        f"{prefix}{events:,} events, {trades:,} trade(s), {snapshots} snapshot(s), "
+        f"{rejected} rejected --> more than one snapshot means a resync",
+        flush=True,
     )
 
 
-async def watch(symbol: str, duration_s: float, data_root: str | None = None) -> None:
+async def watch(
+    symbol: str,
+    duration_s: float,
+    data_root: str | None = None,
+    heartbeat_s: float | None = None,
+) -> None:
     """Consume a live Binance feed, optionally recording it."""
     store = None if data_root is None else EventStore(data_root, "binance", symbol.upper())
     feed = BinanceFeed(symbol)
@@ -141,7 +193,7 @@ async def watch(symbol: str, duration_s: float, data_root: str | None = None) ->
     source = feed.run() if store is None else record(feed.run(), store)
 
     try:
-        await consume(symbol, source, store, duration_s)
+        await consume(symbol, source, store, duration_s, heartbeat_s)
     finally:
         # Closes the Parquet footers. Without them the files hold rows nobody
         # can read, so this has to survive the timeout and a Ctrl-C alike.
@@ -149,7 +201,7 @@ async def watch(symbol: str, duration_s: float, data_root: str | None = None) ->
             store.close()
 
     if store is not None:
-        print(f"recorded to {data_root}/binance/{symbol.upper()}/")
+        print(f"recorded to {data_root}/binance/{symbol.upper()}/", flush=True)
 
 
 async def rerun(symbol: str, date: str, speed: float, data_root: str) -> None:
@@ -188,6 +240,15 @@ def main() -> None:
             date = sys.argv[3] if len(sys.argv) > 3 else _today()
             root = sys.argv[4] if len(sys.argv) > 4 else "data"
             measure(symbol, date, root)
+        elif len(sys.argv) > 1 and sys.argv[1] == "capture":
+            # Hours rather than seconds, and heartbeat logging rather than a
+            # line per update: an overnight run at one update per second would
+            # otherwise emit ~29,000 lines of noise around the few that matter.
+            symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
+            hours = float(sys.argv[3]) if len(sys.argv) > 3 else 8.0
+            root = sys.argv[4] if len(sys.argv) > 4 else "data"
+            beat = float(sys.argv[5]) if len(sys.argv) > 5 else 300.0
+            asyncio.run(watch(symbol, hours * 3600, root, beat))
         elif len(sys.argv) > 1 and sys.argv[1] == "replay":
             symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
             date = sys.argv[3] if len(sys.argv) > 3 else _today()
