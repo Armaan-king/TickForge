@@ -103,23 +103,131 @@ The API exposes `/markets/{symbol}/book`, `/features`, `/trades`, and
 `/system/health`. Decimal values are JSON strings, since a JSON number becomes
 a float in every client and discards the exactness the pipeline preserves.
 
-## Project structure
+## Components
+
+Each stage below owns one job and hands the next a type, not a method call.
+Where a component enforces an architectural rule, the rule is named, because
+that is usually the reason the boundary sits where it does.
+
+### `events.py` — the contract
+
+`BookSnapshot`, `BookUpdate`, `Trade`, and the `MarketEvent` union of the
+three. Frozen slotted dataclasses, prices and quantities as `Decimal`,
+timestamps as integer nanoseconds. `Side` is a `StrEnum` so it writes to
+Parquet and JSON with no conversion step.
+
+Every field is venue-neutral. Widening the union is an API change, not an
+addition: every `isinstance` dispatch downstream gains a case it does not
+handle, which is exactly what happened when `Trade` was introduced.
+
+### `adapters/` — the only place Binance exists
+
+`binance.py` is pure translation. `parse_depth_update`, `parse_trade`,
+`parse_snapshot` and `parse_stream_frame` turn wire bytes into events, and
+Binance's field names (`U`, `u`, `b`, `a`, `m`) appear nowhere else in the
+codebase. It resolves the two Binance quirks that matter: `T` (match time)
+rather than `E` (emission time), and the maker flag inverted into an aggressor
+`Side`.
+
+`binance_feed.py` owns connection lifecycle. `BinanceFeed.run()` opens the
+combined depth-and-trade stream, buffers updates while `fetch_snapshot` runs
+concurrently, joins them with `updates_after_snapshot`, then validates every
+subsequent update. `require_fresh` wraps the socket in a per-message timeout,
+so a connection that stays open while delivering nothing raises instead of
+hanging. `SequenceGapError`, `SnapshotTooOldError` and `StaleFeedError` all
+subclass `ResyncRequired`, so recovery is one path: fetch a new snapshot.
+
+The feed's sequence check deliberately mirrors the book's. A feed laxer than
+the book it feeds would let through an update the book rejects, and the book
+would go invalid permanently with nothing able to resynchronise it.
+
+### `book.py` — reconstruction
+
+`OrderBook` maintains two `dict[Decimal, Decimal]` sides and a lifecycle:
+`EMPTY → SEEDED → SYNCED`, with `INVALID` reachable from either. `apply`
+returns an `ApplyResult` rather than raising, because gaps are routine; reads
+(`best_bid`, `top_bids`, …) raise `BookInvalidError` instead, because serving
+a known-wrong number is not.
+
+The two guards are independent on purpose. A caller who ignores the result
+still cannot get plausible wrong numbers out of the book.
+
+No clock, no network, no venue knowledge. That is what makes it identical
+under live and replay, and testable without either.
+
+### `analytics.py` — features
+
+Two kinds, and the split is the design. The **pure functions** (`spread`,
+`midprice`, `microprice`, `market_depth`, `imbalance`) read a book at one
+instant and never mutate it. **`FlowFeatures`** holds a rolling window for the
+four that measure change or accumulation: order-flow imbalance, trade
+imbalance, VWAP, realised volatility.
+
+That window is the only clock in the pipeline, and it runs on event time. A
+wall clock would place every recorded event outside the window during replay,
+returning nothing for the whole run after working perfectly live.
+
+`feature_snapshot` collects all thirteen into a `FeatureSnapshot`. Nearly
+every field is nullable and the nulls carry meaning: a one-sided book has no
+midprice, an empty window no VWAP, and a window spanning a resync no order
+flow. `None` is *undefined*, never zero.
+
+### `storage.py` — persistence
+
+`EventStore` writes date-partitioned Parquet, one file per event type per
+capture session, buffering into row groups. `record()` tees the feed rather
+than each consumer calling `write()`, so the recorded stream is *definitionally*
+the emitted stream instead of whatever survived a caller's control flow.
+
+Prices are `decimal128(38,18)`. Each row carries a `capture_seq` because
+neither timestamp column can order the stream: `time.time_ns()` resolves to
+~0.6 ms on this machine so events collide, and the exchange clock leads it far
+enough that an event's timestamp can precede its own arrival.
+
+### `replay.py` — the same events, from disk
+
+`read_partition` reads a day back into `MarketEvent`s ordered by
+`(session, capture_seq)`. `replay` yields them at the seam `BinanceFeed.run()`
+yields at, optionally paced by their original arrival gaps.
+
+Pacing is the one permitted wall clock in the system: it changes *when* an
+event appears, never what it is. Two replays at different speeds produce
+identical output, and a test asserts it.
+
+### Interfaces
+
+`__main__.py` holds `consume()`, which drives book, analytics and storage from
+an `AsyncIterator[MarketEvent]` and **contains no branch on live versus
+replay**. `watch` feeds it a socket, `rerun` feeds it a file. That absence of a
+branch is the architectural claim, made load-bearing rather than asserted.
+
+`api.py` runs the feed in a background task and serves the state it maintains
+over four endpoints. Handlers are `async` deliberately: a synchronous handler
+would run in a thread pool and could read the book mid-update.
+
+`bench.py` profiles the pipeline over a recorded capture, so two runs measure
+identical work. That reproducibility is what separates a benchmark from a
+stopwatch.
+
+### Layout
 
 ```
 src/tickforge/
-  events.py            Normalized event types. Nothing here knows a venue exists.
-  book.py              L2 reconstruction and the validity state machine.
-  analytics.py         Pure book features, plus rolling-window flow features.
-  storage.py           Date-partitioned Parquet writer.
-  replay.py            Captures back into events, in capture order.
-  api.py               FastAPI surface over live state.
-  bench.py             Latency percentiles and throughput.
-  adapters/binance.py       Wire format. The only file that knows Binance's field names.
+  events.py                 Normalized event types and the MarketEvent union.
+  book.py                   L2 reconstruction and the validity state machine.
+  analytics.py              Pure book features, plus the rolling-window ones.
+  storage.py                Date-partitioned Parquet writer and the record tee.
+  replay.py                 Captures back into events, in capture order.
+  api.py                    FastAPI surface over live state.
+  bench.py                  Latency percentiles, throughput, memory.
+  __main__.py               CLI: watch, capture, replay, bench.
+  adapters/binance.py       Wire format. The only file that knows Binance.
   adapters/binance_feed.py  Connection lifecycle, resync, staleness.
-tests/                 193 tests, roughly one line of test per line of source.
-tests/test_properties.py  Hypothesis invariants, including the book as a state machine.
-benchmarks/            Per-operation timings, excluded from the default suite.
-docs/knowledge/        Design reasons, architectural boundaries, recorded pitfalls.
+tests/                      193 tests, roughly one line of test per line of source.
+tests/test_properties.py    Hypothesis invariants; the book as a state machine.
+benchmarks/                 Per-operation timings, excluded from the default suite.
+docs/knowledge/             Design reasons, boundaries, recorded pitfalls.
+docs/superpowers/specs/     Design docs for storage and replay, with rejects.
 ```
 
 ## Measured
