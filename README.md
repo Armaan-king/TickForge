@@ -179,6 +179,36 @@ separate test pins that it does *not* go unknown.
 session, replays it twice, and asserts the two feature streams are equal. Two
 full CLI replays were also checked to produce matching SHA-256 output.
 
+### Looking at what a run actually did
+
+Tests leave nothing behind; they write to temp directories and delete them.
+Captures are the durable record, and they live in
+`data/binance/<SYMBOL>/<date>/`. Parquet is binary, so:
+
+```bash
+uv run python -m tickforge BTCUSDT 60 data       # record something first
+uv run python scripts/show_capture.py            # today
+uv run python scripts/show_capture.py 2026-09-08 # a specific day
+uv run python scripts/show_capture.py 2026-09-08 csv   # also write CSVs
+```
+
+It prints the first rows of each stream, then the check that matters:
+
+```
+book updates : 30
+sequence gaps: 0   (0 means the book saw every update)
+covering     : 13,576 exchange sequence numbers
+```
+
+Zero gaps across 13,576 sequence numbers means the book accounted for every
+update Binance issued during the capture. That single line is the clearest
+evidence the reconstruction is correct on real data rather than on fixtures.
+
+`csv` writes one file per stream beside the Parquet, with book levels exploded
+to one row per level and decimals emitted as text so a spreadsheet cannot
+round them back into floats. Output stays under `data/`, which is gitignored,
+so market data cannot end up committed.
+
 ### Benchmarks
 
 Excluded from the default suite via `testpaths`, because a suite you hesitate
@@ -315,6 +345,7 @@ src/tickforge/
 tests/                      193 tests, roughly one line of test per line of source.
 tests/test_properties.py    Hypothesis invariants; the book as a state machine.
 benchmarks/                 Per-operation timings, excluded from the default suite.
+scripts/show_capture.py     Print or export a capture; checks sequence continuity.
 docs/knowledge/             Design reasons, boundaries, recorded pitfalls.
 docs/superpowers/specs/     Design docs for storage and replay, with rejects.
 ```
