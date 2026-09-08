@@ -1,7 +1,7 @@
 [project]
 name = "tickforge"
 version = "0.1.0"
-description = "Add your description here"
+description = "Real-time crypto market-data infrastructure: L2 book reconstruction, microstructure analytics, and deterministic replay"
 readme = "README.md"
 authors = [
     { name = "Armaan-king", email = "ARMAAN002@e.ntu.edu.sg" }
@@ -23,7 +23,7 @@ build-backend = "uv_build"
 [tool.pytest.ini_options]
 # `benchmarks/` is excluded on purpose: it takes seconds per run, and a suite
 # you hesitate to run is a suite that stops catching things.
-#   uv run pytest              the 158 correctness tests
+#   uv run pytest              the correctness suite
 #   uv run pytest benchmarks/  the timings
 testpaths = ["tests"]
 
