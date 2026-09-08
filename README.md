@@ -30,6 +30,10 @@ Not a matching engine, not a low-latency trading system.
   match or delete levels.
 - **Deterministic replay.** Two replays of the same capture produce identical
   output, verified by matching SHA-256 over full CLI runs.
+- **Invariants, not just examples.** Hypothesis drives the book as a state
+  machine, checking after every generated operation that a valid book is never
+  crossed, an invalid one refuses every read, and no zero-quantity level is
+  ever stored.
 
 ## How it works
 
@@ -64,8 +68,8 @@ quietly become a different system, and every determinism guarantee with it.
 
 Python 3.12+, `asyncio` throughout. `websockets` and `httpx` for ingestion,
 `pyarrow` for Parquet, `polars` for querying captures, FastAPI and uvicorn for
-the HTTP layer. `pytest` and `pytest-benchmark` for the 184-test suite and the
-timings. Managed with `uv`.
+the HTTP layer. `pytest`, `hypothesis` and `pytest-benchmark` for the 193-test
+suite, the invariants, and the timings. Managed with `uv`.
 
 ## Getting started
 
@@ -112,7 +116,8 @@ src/tickforge/
   bench.py             Latency percentiles and throughput.
   adapters/binance.py       Wire format. The only file that knows Binance's field names.
   adapters/binance_feed.py  Connection lifecycle, resync, staleness.
-tests/                 184 tests, roughly one line of test per line of source.
+tests/                 193 tests, roughly one line of test per line of source.
+tests/test_properties.py  Hypothesis invariants, including the book as a state machine.
 benchmarks/            Per-operation timings, excluded from the default suite.
 docs/knowledge/        Design reasons, architectural boundaries, recorded pitfalls.
 ```
