@@ -184,9 +184,14 @@ async def watch(
     duration_s: float,
     data_root: str | None = None,
     heartbeat_s: float | None = None,
+    roll_rows: int | None = None,
 ) -> None:
     """Consume a live Binance feed, optionally recording it."""
-    store = None if data_root is None else EventStore(data_root, "binance", symbol.upper())
+    store = (
+        None
+        if data_root is None
+        else EventStore(data_root, "binance", symbol.upper(), roll_rows=roll_rows)
+    )
     feed = BinanceFeed(symbol)
     # Teed at the feed, so the recording is the raw emitted stream rather than
     # whatever survived the consuming loop's control flow.
@@ -248,7 +253,10 @@ def main() -> None:
             hours = float(sys.argv[3]) if len(sys.argv) > 3 else 8.0
             root = sys.argv[4] if len(sys.argv) > 4 else "data"
             beat = float(sys.argv[5]) if len(sys.argv) > 5 else 300.0
-            asyncio.run(watch(symbol, hours * 3600, root, beat))
+            # Roughly five minutes of BTCUSDT. A kill costs that much, rather
+            # than the whole capture -- a file with no footer is unreadable, so
+            # without rolling an interrupted run loses everything it recorded.
+            asyncio.run(watch(symbol, hours * 3600, root, beat, roll_rows=50_000))
         elif len(sys.argv) > 1 and sys.argv[1] == "replay":
             symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
             date = sys.argv[3] if len(sys.argv) > 3 else _today()

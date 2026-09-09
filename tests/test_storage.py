@@ -159,6 +159,37 @@ def test_two_sessions_both_survive(tmp_path) -> None:
     assert sorted(row["first_seq"] for row in read(tmp_path, "book_updates")) == [1, 2]
 
 
+def test_rolling_leaves_earlier_files_readable(tmp_path) -> None:
+    """The durability fix, measured the hard way.
+
+    Flushing writes row groups but not the footer, and a file without a footer
+    cannot be read at all -- so a capture killed mid-run loses everything
+    rather than its tail. An overnight run whose machine slept left 12.5 MB of
+    real market data unrecoverable. Rolling closes files as it goes.
+    """
+    store = EventStore(tmp_path, "binance", "BTCUSDT", session=1, roll_rows=3)
+    for seq in range(7):
+        store.write(update(first_seq=seq + 1, last_seq=seq + 1))
+
+    # Deliberately not closed: this is the state a killed process leaves.
+    assert len(files(tmp_path, "book_updates")) >= 2
+    recovered = read(tmp_path, "book_updates")
+    assert len(recovered) >= 6  # only the unclosed tail is at risk
+
+    store.close()
+
+
+def test_capture_seq_stays_dense_across_a_roll(tmp_path) -> None:
+    """Rolling must not restart the counter, or replay cannot order the files
+    against each other."""
+    with EventStore(tmp_path, "binance", "BTCUSDT", session=1, roll_rows=2) as store:
+        for seq in range(6):
+            store.write(update(first_seq=seq + 1, last_seq=seq + 1))
+
+    seqs = sorted(row["capture_seq"] for row in read(tmp_path, "book_updates"))
+    assert seqs == list(range(6))
+
+
 def test_sequence_range_is_preserved(tmp_path) -> None:
     """Replay needs the update boundary intact -- the range describes the whole
     batch of levels, so a schema that lost it could not reconstruct the book."""

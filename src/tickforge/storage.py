@@ -212,6 +212,7 @@ class EventStore:
         batch_rows: int = 5_000,
         batch_ns: int = 30 * NS_PER_SECOND,
         session: int | None = None,
+        roll_rows: int | None = None,
     ) -> None:
         """
         Args:
@@ -225,12 +226,23 @@ class EventStore:
             session: Stamp distinguishing this capture's files from an earlier
                 one in the same partition. Defaults to now. Wall clock, but it
                 only names files -- it never reaches a stored value.
+            roll_rows: Close the current files and start new ones after this
+                many rows. Flushing writes row groups but not the footer, and a
+                file without a footer cannot be read at all -- so a capture
+                killed mid-run loses everything, not just its tail. Measured
+                the hard way: a machine sleeping through an overnight run left
+                12.5 MB of real market data unreadable.
+
+                Rows rather than elapsed time, so no clock is involved and
+                replaying the same events produces identical file boundaries.
+                None keeps one file per session, which is right for short runs.
         """
         self._root = Path(root)
         self._exchange = exchange
         self._symbol = symbol
         self._batch_rows = batch_rows
         self._batch_ns = batch_ns
+        self._roll_rows = roll_rows
         self._session = time.time_ns() if session is None else session
         self._date: str | None = None
         self._writers: dict[str, pq.ParquetWriter] = {}
@@ -238,6 +250,7 @@ class EventStore:
         self._last_flush_ns: int | None = None
         # Dense across all three raw streams. Replay's ordering key, see _ORDER.
         self._capture_seq = 0
+        self._rows_since_roll = 0
 
     def __enter__(self) -> "EventStore":
         return self
@@ -272,10 +285,31 @@ class EventStore:
             self._last_flush_ns = timestamp_ns
 
         self._buffers[stream].append(row)
+        self._rows_since_roll += 1
 
         if self._due(timestamp_ns):
             self.flush()
             self._last_flush_ns = timestamp_ns
+
+        if self._roll_rows and self._rows_since_roll >= self._roll_rows:
+            self._new_session()
+
+    def _new_session(self) -> None:
+        """Close the current files so they become readable, then start fresh.
+
+        The stamp is incremented rather than re-read from the clock.
+        `time.time_ns()` resolves to ~0.6 ms on Windows and rolls can happen
+        microseconds apart, so re-reading it hands consecutive chunks the same
+        stamp -- and the second silently overwrites the first. The same clock
+        granularity that made `capture_seq` necessary, in a new place.
+
+        `capture_seq` deliberately does not reset: it stays dense across the
+        whole capture, so ordering within and between rolled files is
+        unambiguous.
+        """
+        self.close()
+        self._session += 1
+        self._rows_since_roll = 0
 
     def flush(self) -> None:
         """Write every buffered row out as a row group."""

@@ -109,6 +109,25 @@ def test_every_event_comes_back_identical(tmp_path) -> None:
     assert read_partition(tmp_path, "binance", "BTCUSDT", DAY) == SESSION
 
 
+def test_a_rolled_capture_replays_in_one_stream(tmp_path) -> None:
+    """A long capture rolls its files so a kill cannot lose the whole run.
+
+    Replay has to stitch them back into one ordered stream, which works because
+    the session stamps sort and `capture_seq` stays dense across the roll.
+    """
+    long_session = [snapshot()] + [
+        trade(at=T0 + n, trade_id=n) if n % 3 == 0 else update(100 + n, at=T0 + n)
+        for n in range(1, 25)
+    ]
+    with EventStore(tmp_path, "binance", "BTCUSDT", roll_rows=5) as store:
+        for event in long_session:
+            store.write(event)
+
+    directory = tmp_path / "binance" / "BTCUSDT" / DAY
+    assert len(list(directory.glob("*.parquet"))) > 3  # it really did roll
+    assert read_partition(tmp_path, "binance", "BTCUSDT", DAY) == long_session
+
+
 def test_zero_quantities_survive(tmp_path) -> None:
     """A zero quantity is a delete. Dropping one on the way back would leave
     the replayed book holding a level the exchange removed."""
