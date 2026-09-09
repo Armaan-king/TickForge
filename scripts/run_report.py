@@ -131,6 +131,11 @@ def read_data(root: Path, dates: list[str]) -> None:
 
 
 def main() -> None:
+    # Polars draws tables with box characters, which Windows' cp1252 console
+    # cannot encode. Without this the report crashes the moment it prints one.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     root = Path(sys.argv[1] if len(sys.argv) > 1 else "C:/tickforge-runs")
     if len(sys.argv) > 2:
         dates = sys.argv[2:]
@@ -142,7 +147,9 @@ def main() -> None:
             today.strftime("%Y-%m-%d"),
         ]
 
-    read_log(root / "overnight.log")
+    # The launcher writes capture-<stamp>.log; older runs used overnight.log.
+    logs = sorted(root.glob("capture-*.log")) + sorted(root.glob("overnight.log"))
+    read_log(logs[-1] if logs else root / "overnight.log")
     read_data(root, dates)
 
     err = root / "overnight.err"
