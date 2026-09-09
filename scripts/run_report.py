@@ -2,8 +2,8 @@
 
 Written for reading the morning after an overnight run.
 
-    uv run python scripts/run_report.py C:\\tickforge-runs
-    uv run python scripts/run_report.py C:\\tickforge-runs 2026-09-09
+    uv run python scripts/run_report.py
+    uv run python scripts/run_report.py runs 2026-09-09
 """
 
 import datetime as dt
@@ -136,7 +136,11 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    root = Path(sys.argv[1] if len(sys.argv) > 1 else "C:/tickforge-runs")
+    # `runs/` is a junction to wherever long captures are kept; `data/` is
+    # what the CLI writes by default. No absolute path, so this works on a
+    # fresh clone rather than only on the machine it was written on.
+    default = "runs" if Path("runs").is_dir() else "data"
+    root = Path(sys.argv[1] if len(sys.argv) > 1 else default)
     if len(sys.argv) > 2:
         dates = sys.argv[2:]
     else:

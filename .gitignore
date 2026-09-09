@@ -19,3 +19,8 @@ Thumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# Capture output. `runs` is a junction to a folder outside OneDrive, so
+# hours of Parquet writes do not churn sync.
+runs/
+*.log

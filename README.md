@@ -346,6 +346,8 @@ tests/                      193 tests, roughly one line of test per line of sour
 tests/test_properties.py    Hypothesis invariants; the book as a state machine.
 benchmarks/                 Per-operation timings, excluded from the default suite.
 scripts/show_capture.py     Print or export a capture; checks sequence continuity.
+scripts/run_report.py       Summarise a long run: its log, then the data it wrote.
+scripts/run_capture.ps1     Launch a multi-hour capture; blocks sleep while it runs.
 docs/knowledge/             Design reasons, boundaries, recorded pitfalls.
 docs/superpowers/specs/     Design docs for storage and replay, with rejects.
 ```

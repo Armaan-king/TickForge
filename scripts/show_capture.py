@@ -14,7 +14,18 @@ from pathlib import Path
 
 import polars as pl
 
-ROOT = Path("data/binance/BTCUSDT")
+
+def capture_root() -> Path:
+    """Where captures live: `runs/` if present, else `data/`.
+
+    `runs/` is a junction to a folder outside OneDrive, used for long captures
+    because hours of Parquet writes churn sync. A fresh clone has no such
+    junction, so `data/` -- what the CLI writes by default -- is the fallback.
+    """
+    return Path("runs" if Path("runs").is_dir() else "data") / "binance" / "BTCUSDT"
+
+
+ROOT = capture_root()
 STREAMS = ("snapshots", "trades", "book_updates", "features")
 
 
