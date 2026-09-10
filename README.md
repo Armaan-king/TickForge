@@ -157,6 +157,11 @@ df = df.sort("session", "capture_seq")    # both, never capture_seq alone
 The export adds a `session` column the stored files do not carry — their
 filename holds it, and a merged file has no filename per row.
 
+⚠️ **`timestamp_ns` is not unique.** Binance stamps trades in milliseconds, so
+on a real capture roughly 91% of events share a timestamp with another — two
+distinct trades at the same nanosecond is ordinary, not an anomaly. Key on
+`(session, capture_seq)`, or on `trade_id` for trades.
+
 **What it deliberately does not do.** No ML labels, windows, normalisation or
 regime tags, and no inferring `CANCEL`/`EXECUTE` from a depth decrease. A
 quantity of zero is reported as a level with quantity zero, because reading
