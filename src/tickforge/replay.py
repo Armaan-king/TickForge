@@ -33,13 +33,16 @@ def _levels(structs: list[dict]) -> tuple[tuple[Decimal, Decimal], ...]:
     return tuple((level["price"], level["quantity"]) for level in structs)
 
 
-def _event(row: dict, stream: str) -> MarketEvent:
+def event_from_row(row: dict, stream: str) -> MarketEvent:
     """One stored row back into the event that produced it.
 
     The inverse of `EventStore._row`. Reading a price back rescales it to 18
     decimal places, which is a different representation of the same value --
     and Python hashes Decimals by value, so the replayed price is the same
     order-book dict key. Nothing needs converting.
+
+    Public because `research.py` reconstructs the same events for its HTTP
+    view: one decoder, so the API cannot drift from what replay produces.
     """
     common = (row["exchange"], row["symbol"], row["timestamp_ns"], row["received_ns"])
     if stream == "trades":
@@ -66,13 +69,15 @@ def _event(row: dict, stream: str) -> MarketEvent:
     )
 
 
-def _session_files(directory: Path) -> dict[int, dict[str, Path]]:
+def session_files(directory: Path) -> dict[int, dict[str, Path]]:
     """A partition's files grouped by capture session.
 
     Returns:
         ``{session_stamp: {stream: path}}``. Features are excluded -- they are
         derived output, and replaying them would defeat the point of
         recomputing them.
+
+    Public because `research.py` catalogues the same partitions.
     """
     sessions: dict[int, dict[str, Path]] = {}
     for path in directory.glob("*.parquet"):
@@ -99,7 +104,7 @@ def read_partition(
         FileNotFoundError: No capture exists for that partition.
     """
     directory = Path(root) / exchange / symbol / date
-    sessions = _session_files(directory) if directory.is_dir() else {}
+    sessions = session_files(directory) if directory.is_dir() else {}
     if not sessions:
         raise FileNotFoundError(f"no capture at {directory}")
 
@@ -110,7 +115,7 @@ def read_partition(
         rows: list[tuple[int, MarketEvent]] = []
         for stream, path in sessions[session].items():
             for row in pq.read_table(path).to_pylist():
-                rows.append((row["capture_seq"], _event(row, stream)))
+                rows.append((row["capture_seq"], event_from_row(row, stream)))
         rows.sort(key=lambda pair: pair[0])
         events.extend(event for _, event in rows)
     return events

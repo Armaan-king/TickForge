@@ -76,6 +76,18 @@ gets ignored.
 - **Breaks if violated:** replaying the same events stops producing the same
   features, and Phase 6 determinism fails.
 
+### The research boundary exposes facts, not interpretations
+
+- **Rule:** the research API serves recorded events exactly as stored, in
+  replay order. It must not label, window, normalise, aggregate, or infer
+  order-lifecycle events from depth changes.
+- **Why:** a depth decrease could be a cancellation or a fill, and the exchange
+  never says which. Choosing is a modelling assumption. Once TickForge makes it,
+  every consumer inherits it invisibly and none can undo it.
+- **Breaks if violated:** downstream models train on TickForge's assumptions
+  believing them to be exchange facts, and a wrong assumption becomes
+  unfalsifiable because the raw distinction was discarded before they saw it.
+
 ## Data flow
 
 Conceptual stages — what each produces, not which module calls which.

@@ -21,6 +21,7 @@ from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request
 
+from tickforge import research
 from tickforge.adapters.binance_feed import BinanceFeed
 from tickforge.analytics import FeatureSnapshot, FlowFeatures, feature_snapshot
 from tickforge.book import ApplyResult, OrderBook
@@ -104,6 +105,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(lifespan=lifespan, title="TickForge")
+
+# Read-only access to recorded captures. Deliberately independent of the live
+# feed above: these routes touch storage only, so they keep answering when the
+# feed is degraded or was never started.
+app.include_router(research.router)
 
 
 def _state_for(request: Request, symbol: str) -> MarketState:

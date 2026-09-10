@@ -438,6 +438,57 @@ Possible consumers include:
 
 ---
 
+## Phase 11 — Historical Research Boundary
+
+Phase 10 exposed *live* state. This phase exposes *recorded* history, so a
+separate project can consume TickForge datasets without importing TickForge or
+reimplementing its Binance connectivity, sequencing and replay.
+
+```text
+GET /research/{symbol}/sessions
+GET /research/{symbol}/events
+GET /research/{symbol}/export
+```
+
+Two access shapes, because one does not serve both jobs:
+
+* `/events` returns JSON pages for browsing and small ranges.
+* `/export` returns one merged Parquet file per stream and date, for datasets.
+
+The split is forced by measurement rather than taste. Event sizes vary by
+roughly 750x — a trade is ~264 bytes of JSON, a book update's median is 8 KB
+with a 200 KB tail, and a 2,000-level snapshot is 150 KB — so pages are bounded
+by a byte budget as well as a row count, and anything dataset-sized goes
+through the columnar path.
+
+Ordering is `(session, capture_seq)`, identical to replay. `capture_seq`
+restarts at zero for every capture, so it cannot order two captures recorded on
+the same day, and pagination cursors carry both.
+
+### The boundary
+
+TickForge keeps owning connectivity, normalization, L2 reconstruction,
+sequence validation and resynchronization, `capture_seq` ordering, persistence,
+deterministic replay, and generic microstructure features.
+
+The research interface is a thin read-only view over those. It must **not**
+acquire:
+
+* ML preprocessing or normalization
+* model-specific labels, training windows, or regime tags
+* inferred order-lifecycle events
+
+That last one matters most. A depth decrease is not a cancel and not an
+execution — distinguishing them requires assumptions the exchange never sent.
+TickForge reports the market fact: a level whose quantity is now zero. Reading
+intent out of it is modelling, and modelling belongs to the consumer.
+
+**Consequence:** a downstream project requests a period, receives ordered
+events, caches them locally, and builds its own sequences. It never makes one
+request per training sample.
+
+---
+
 ## Engineering Principles
 
 The project will follow several core principles.
@@ -504,6 +555,8 @@ The completed project should contain:
 ✓ Profiling and performance benchmarks
 
 ✓ Research/API interface
+
+✓ Historical research boundary for downstream consumers
 
 ✓ Clear documentation and architecture diagrams
 ```

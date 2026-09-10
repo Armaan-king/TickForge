@@ -68,7 +68,7 @@ quietly become a different system, and every determinism guarantee with it.
 
 Python 3.12+, `asyncio` throughout. `websockets` and `httpx` for ingestion,
 `pyarrow` for Parquet, `polars` for querying captures, FastAPI and uvicorn for
-the HTTP layer. `pytest`, `hypothesis` and `pytest-benchmark` for the 193-test
+the HTTP layer. `pytest`, `hypothesis` and `pytest-benchmark` for the 225-test
 suite, the invariants, and the timings. Managed with `uv`.
 
 ## Getting started
@@ -103,10 +103,69 @@ The API exposes `/markets/{symbol}/book`, `/features`, `/trades`, and
 `/system/health`. Decimal values are JSON strings, since a JSON number becomes
 a float in every client and discards the exactness the pipeline preserves.
 
+## Research access
+
+Three read-only endpoints let a downstream project pull recorded history
+without importing TickForge or rebuilding its Binance, sequencing and replay
+logic. They read storage only, so they keep answering when the live feed is
+degraded or was never started.
+
+```bash
+GET /research/{symbol}/sessions[?date=]
+GET /research/{symbol}/events   ?date= [&session=] [&start_seq=] [&end_seq=]
+                                [&start_ns=] [&end_ns=] [&limit=] [&cursor=]
+GET /research/{symbol}/export   ?date= &stream= [&session=]
+```
+
+`TICKFORGE_DATA_ROOT` selects the capture directory; otherwise `runs/` then
+`data/`.
+
+**`/sessions`** catalogues what exists — dates, capture sessions, and per
+stream the row count plus the `capture_seq` and `timestamp_ns` ranges it
+covers. Read from Parquet footers, so a 34-file day catalogues in ~265 ms
+without touching a data page.
+
+**`/events`** returns JSON pages **in exactly the order `replay` produces**,
+which is `(session, capture_seq)`. Events carry `type`, `session`, `exchange`,
+`symbol`, `timestamp_ns`, `received_ns`, and then `trade_id`/`price`/
+`quantity`/`aggressor` for a trade, or `first_seq`/`last_seq`/`bids`/`asks`
+for a book event. Prices and quantities are strings.
+
+Pages are bounded by a row limit *and* a byte budget, because event sizes vary
+about 750×: a trade is ~264 bytes of JSON, a book update's median is 8 KB with
+a 200 KB tail, and a 2,000-level snapshot is 150 KB. `next_cursor` is opaque
+and encodes `(session, capture_seq)` — `capture_seq` restarts at zero for each
+capture, so it cannot order two of them alone.
+
+**`/export`** is the bulk path: one request returns every session for one
+stream and date as a single merged Parquet file, written row group by row
+group so peak memory stays ~0.2 MiB regardless of size. A full day of BTCUSDT
+trades — 1.6 M rows, 27 MB across 34 stored files — comes back as one 15 MB
+download.
+
+```python
+import io
+
+import polars as pl, requests
+
+raw = requests.get("http://localhost:8000/research/BTCUSDT/export",
+                   params={"date": "2026-09-09", "stream": "trades"}).content
+df = pl.read_parquet(io.BytesIO(raw))     # Decimal(38, 18) preserved
+df = df.sort("session", "capture_seq")    # both, never capture_seq alone
+```
+
+The export adds a `session` column the stored files do not carry — their
+filename holds it, and a merged file has no filename per row.
+
+**What it deliberately does not do.** No ML labels, windows, normalisation or
+regime tags, and no inferring `CANCEL`/`EXECUTE` from a depth decrease. A
+quantity of zero is reported as a level with quantity zero, because reading
+intent out of that is a modelling decision that belongs to the consumer.
+
 ## Testing
 
 ```bash
-uv run pytest                      # all 193, ~10s, no network
+uv run pytest                      # all 225, ~13s, no network
 uv run pytest -v                   # every test name; they read as a spec
 uv run pytest tests/test_order_book.py    # one file
 uv run pytest -k microprice        # by name fragment, across files
@@ -131,6 +190,7 @@ list honest.
 | `test_analytics.py` | 19 | Spread, midprice, microprice, imbalance, depth |
 | `test_replay.py` | 12 | Determinism, ordering, pacing |
 | `test_properties.py` | 9 | Hypothesis invariants (each generates hundreds of cases) |
+| `test_research.py` | 29 | Research ordering, filtering, pagination, export |
 | `test_docs.py` | 3 | Markdown links resolve |
 
 ### Property-based tests
@@ -321,7 +381,9 @@ replay**. `watch` feeds it a socket, `rerun` feeds it a file. That absence of a
 branch is the architectural claim, made load-bearing rather than asserted.
 
 `api.py` runs the feed in a background task and serves the state it maintains
-over four endpoints. Handlers are `async` deliberately: a synchronous handler
+over four endpoints. `research.py` adds three read-only ones over recorded
+captures, reusing replay's row decoder so the HTTP view cannot drift from what
+replay produces. Handlers are `async` deliberately: a synchronous handler
 would run in a thread pool and could read the book mid-update.
 
 `bench.py` profiles the pipeline over a recorded capture, so two runs measure
@@ -338,11 +400,12 @@ src/tickforge/
   storage.py                Date-partitioned Parquet writer and the record tee.
   replay.py                 Captures back into events, in capture order.
   api.py                    FastAPI surface over live state.
+  research.py               Read-only HTTP access to recorded captures.
   bench.py                  Latency percentiles, throughput, memory.
   __main__.py               CLI: watch, capture, replay, bench.
   adapters/binance.py       Wire format. The only file that knows Binance.
   adapters/binance_feed.py  Connection lifecycle, resync, staleness.
-tests/                      193 tests, roughly one line of test per line of source.
+tests/                      225 tests, roughly one line of test per line of source.
 tests/test_properties.py    Hypothesis invariants; the book as a state machine.
 benchmarks/                 Per-operation timings, excluded from the default suite.
 scripts/show_capture.py     Print or export a capture; checks sequence continuity.
